@@ -44,6 +44,12 @@ func ExportName(workflowID, runID string) string {
 	return "exports/" + url.PathEscape(workflowID) + "/" + url.PathEscape(runID) + ".json.gz"
 }
 
+// StateName is the object name of the documents that a run passes to the next
+// run, when they are too large for the continue-as-new input.
+func StateName(workflowID, runID string) string {
+	return "state/" + url.PathEscape(workflowID) + "/" + url.PathEscape(runID) + ".json"
+}
+
 // ChainName is the object name of a workflow's chain manifest.
 func ChainName(workflowID string) string {
 	return "chains/" + url.PathEscape(workflowID) + ".json"
