@@ -2,6 +2,8 @@
 
 The Temporal backend plugin of Spec Studio. It keeps each spec in one Temporal workflow, for both Spec Studio hosts: the relay and the Mac app. The relay's messages and the app's events go into the same workflow, so each spec has one full history. The app can replay a spec from its start.
 
+When a host uses this plugin, the plugin is the store of the host. It is not a copy of other data. The Temporal event history is the one source of truth of each spec. Only the Claude Code transcripts, git and the content-addressed blobs are outside it.
+
 The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com/spec-studio-app/plugin-sdk). Read [PROTOCOL.md](https://github.com/spec-studio-app/plugin-sdk/blob/main/PROTOCOL.md) for the calls, the errors and the rules.
 
 ## Contents
