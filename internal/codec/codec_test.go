@@ -94,3 +94,30 @@ func TestRefusals(t *testing.T) {
 		t.Fatal("a payload with a changed key ID decrypts")
 	}
 }
+
+// TestWriteGoVector writes testdata/go-vector.json, a payload that this
+// codec encrypted. The relay's codec decrypts it in the handoff fixture
+// script (R3.S4). It runs only with WRITE_GO_VECTOR=1.
+func TestWriteGoVector(t *testing.T) {
+	if os.Getenv("WRITE_GO_VECTOR") != "1" {
+		t.Skip("WRITE_GO_VECTOR is not 1")
+	}
+	k := key("go-test", 9)
+	c, _ := New([]settings.PayloadKey{k})
+	text := `{"hello":"plugin-temporal","n":2}`
+	enc, err := c.Encode([]*commonpb.Payload{plain(text)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.MarshalIndent(map[string]any{
+		"keyId":         k.ID,
+		"keyBase64":     base64.StdEncoding.EncodeToString(k.Key),
+		"metadata":      map[string]string{"encoding": string(enc[0].Metadata["encoding"]), KeyIDHeader: string(enc[0].Metadata[KeyIDHeader])},
+		"dataBase64":    base64.StdEncoding.EncodeToString(enc[0].Data),
+		"plainEncoding": "json/plain",
+		"plainData":     text,
+	}, "", "  ")
+	if err := os.WriteFile("testdata/go-vector.json", append(out, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

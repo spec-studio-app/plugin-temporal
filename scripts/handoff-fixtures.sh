@@ -33,6 +33,6 @@ if [ -z "${HANDOFF_KEYS:-}" ]; then
   HANDOFF_KEYS="$(node -e 'console.log(require(process.argv[1]).keys)' "$here/testdata/relay/fixtures/expected.json")"
 fi
 HANDOFF_DEPLOY="${HANDOFF_DEPLOY:-h$(node -e 'console.log(require("crypto").randomBytes(4).toString("hex"))')}"
-HANDOFF_OUT="$out" HANDOFF_KEYS="$HANDOFF_KEYS" HANDOFF_DEPLOY="$HANDOFF_DEPLOY" \
+GO_VECTOR="$here/internal/codec/testdata/go-vector.json" HANDOFF_OUT="$out" HANDOFF_KEYS="$HANDOFF_KEYS" HANDOFF_DEPLOY="$HANDOFF_DEPLOY" \
   node --test --test-timeout=120000 dist/test/handoff-fixtures.test.js
 echo "fixtures in $out"

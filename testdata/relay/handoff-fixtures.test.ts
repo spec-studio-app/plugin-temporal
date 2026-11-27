@@ -6,7 +6,7 @@
 // documents to HANDOFF_OUT.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
 import { historyToJSON } from "@temporalio/common/proto-utils";
@@ -22,6 +22,19 @@ import { configStateQuery } from "../src/workflows/relayConfig.js";
 import { stateQuery } from "../src/workflows/spec.js";
 import { deskStateQuery } from "../src/workflows/desk.js";
 import { configTaskQueue } from "../src/temporal/connection.js";
+import { AesGcmCodec } from "../src/codec.js";
+
+// R3.S4: the relay's codec decrypts a payload that plugin-temporal encrypted.
+test("the relay's codec decrypts a payload of the plugin", async () => {
+  const path = process.env.GO_VECTOR;
+  assert.ok(path, "GO_VECTOR is not set");
+  const v = JSON.parse(readFileSync(path, "utf8"));
+  const codec = new AesGcmCodec({ encryptKey: { id: v.keyId, key: Buffer.from(v.keyBase64, "base64") } });
+  const metadata = Object.fromEntries(Object.entries(v.metadata as Record<string, string>).map(([k, val]) => [k, new TextEncoder().encode(val)]));
+  const [plain] = await codec.decode([{ metadata, data: Buffer.from(v.dataBase64, "base64") }]);
+  assert.equal(new TextDecoder().decode(plain.metadata?.encoding ?? new Uint8Array()), v.plainEncoding);
+  assert.equal(new TextDecoder().decode(plain.data ?? new Uint8Array()), v.plainData);
+});
 
 async function history(client: Client, workflowId: string, runId: string): Promise<temporal.api.history.v1.IHistory> {
   const events: temporal.api.history.v1.IHistoryEvent[] = [];

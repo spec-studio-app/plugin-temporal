@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -76,7 +77,7 @@ func TestSecretsStayOut(t *testing.T) {
 	keys := "data:canary-d:" + dataKey + ",config:canary-c:" + configKey
 
 	// A session with real work.
-	run(map[string]string{"address": addr, "payload_keys": keys, "blob_dir": t.TempDir(), "deploy_id": "secrets"}, func(p *client.Process) {
+	run(map[string]string{"address": addr, "payload_keys": keys, "blob_dir": t.TempDir(), "deploy_id": fmt.Sprintf("s%x", time.Now().UnixNano())}, func(p *client.Process) {
 		val, _ := json.Marshal(map[string]string{"text": plain})
 		res, err := p.Put(ctx, protocol.StatePutParams{Collection: "specs", Key: "1a2b3c4d5e6f:s", Value: val})
 		if err != nil {

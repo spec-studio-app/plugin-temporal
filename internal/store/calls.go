@@ -98,9 +98,19 @@ func classify(err error) error {
 
 var errRetry = errors.New("retry")
 
+// callTimeout is the longest time of one store call that has no deadline.
+const callTimeout = 2 * time.Minute
+
 // update sends an update, and starts the workflow when no run runs and
 // start is true. It sends the update again while the run starts or closes.
 func (s *Store) update(ctx context.Context, t route.Target, name string, arg func() any, out any, start bool) error {
+	// A workflow that never answers (for example, its payloads use a key
+	// that this plugin does not have) must not hold a call for ever.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+	}
 	delay := 50 * time.Millisecond
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
