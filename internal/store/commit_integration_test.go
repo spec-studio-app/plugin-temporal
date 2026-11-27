@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -220,15 +221,38 @@ func TestCommitRaceTwoProcesses(t *testing.T) {
 	}
 }
 
-// R10: the storeId names the address, the namespace and the deploy ID.
+// R10: the storeId names the namespace (its name and its ID) and the
+// deploy ID, not the address: two processes that reach the same deploy by
+// two addresses give the same value.
 func TestStoreID(t *testing.T) {
 	e := newEnv(t)
 	s := e.open(Options{})
-	want := "temporal:" + strings.ToLower(e.settings["address"]) + "/default/" + e.deploy
+	if s.namespaceID == "" {
+		t.Fatal("the store has no namespace ID")
+	}
+	want := "temporal:default/" + s.namespaceID + "/" + e.deploy
 	if got := s.StoreID(); got != want {
 		t.Fatalf("storeId %q; want %q", got, want)
 	}
 	if got := e.open(Options{}).StoreID(); got != want {
 		t.Fatalf("a second process gives %q", got)
+	}
+	// The same server by another address.
+	host, port, err := net.SplitHostPort(e.settings["address"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := "localhost"
+	if host == "localhost" {
+		other = "127.0.0.1"
+	}
+	e.settings["address"] = strings.ToUpper(other) + ":" + port
+	if got := e.open(Options{}).StoreID(); got != want {
+		t.Fatalf("a process with the address %s gives %q; want %q", e.settings["address"], got, want)
+	}
+	// Another deploy on the same namespace gives another value.
+	e.settings["deploy_id"] = e.deploy + "x"
+	if got := e.open(Options{}).StoreID(); got == want {
+		t.Fatalf("another deploy gives the same storeId %q", got)
 	}
 }

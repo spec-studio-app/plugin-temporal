@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
@@ -195,12 +194,23 @@ func (s *Store) Commit(ctx context.Context, p protocol.StateCommitParams) (proto
 	return out, nil
 }
 
-// StoreID is the storeId of the handshake: "temporal:<address>/<namespace>/<deploy ID>".
-// Two processes with the same address, namespace and deploy ID use the same
-// workflows, so they give the same value. The address is in lowercase.
+// StoreID is the storeId of the handshake:
+// "temporal:<namespace>/<namespace ID>/<deploy ID>". The namespace and the
+// deploy ID name the workflows; the namespace ID (from DescribeNamespace)
+// tells two servers apart that each have a namespace with the same name
+// (for example "default" on two dev servers). The address is not part of
+// it: one namespace has many addresses (the namespace endpoint and the
+// regional endpoint of Temporal Cloud, a cluster service name and a public
+// host, localhost and 127.0.0.1), and two processes on one deploy must
+// give the same value.
 func (s *Store) StoreID() string {
 	if s.set == nil {
 		return ""
 	}
-	return "temporal:" + strings.ToLower(strings.TrimSpace(s.set.Address)) + "/" + s.set.Namespace + "/" + s.set.DeployID
+	id := s.namespaceID
+	if id == "" {
+		// A server that gives no ID: the name is the best that the plugin has.
+		id = s.set.Namespace
+	}
+	return "temporal:" + s.set.Namespace + "/" + id + "/" + s.set.DeployID
 }

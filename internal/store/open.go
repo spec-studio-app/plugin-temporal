@@ -53,8 +53,11 @@ type Store struct {
 	dataDC   converter.DataConverter
 	configDC converter.DataConverter
 	blobs    blobstore.Store
-	workers  []worker.Worker
-	log      *slog.Logger
+	// namespaceID is the ID of the namespace (from DescribeNamespace), for
+	// the storeId.
+	namespaceID string
+	workers     []worker.Worker
+	log         *slog.Logger
 }
 
 // New makes a store. Open connects it, and reads the options then (after the
@@ -179,7 +182,8 @@ func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
 // checkServer checks the namespace and the server version.
 func (s *Store) checkServer(ctx context.Context) error {
 	svc := s.data.WorkflowService()
-	if _, err := svc.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: s.set.Namespace}); err != nil {
+	ns, err := svc.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: s.set.Namespace})
+	if err != nil {
 		var nf *serviceerror.NamespaceNotFound
 		var nf2 *serviceerror.NotFound
 		if errors.As(err, &nf) || errors.As(err, &nf2) {
@@ -191,6 +195,7 @@ func (s *Store) checkServer(ctx context.Context) error {
 		}
 		return protocol.NewError(protocol.Unavailable, unreachable)
 	}
+	s.namespaceID = ns.GetNamespaceInfo().GetId()
 	info, err := svc.GetSystemInfo(ctx, &workflowservice.GetSystemInfoRequest{})
 	if err == nil && info.GetServerVersion() != "" && versionLess(info.GetServerVersion(), minServer) {
 		return protocol.NewError(protocol.Unavailable, "The Temporal server is version %s. The plugin needs %s or later (update-with-start). Update the server, or use Temporal Cloud.", info.GetServerVersion(), minServer)
