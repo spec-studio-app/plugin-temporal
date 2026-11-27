@@ -75,7 +75,7 @@ func (s *Store) streamState(ctx context.Context, t route.Target) (*streamState, 
 
 // runEvents reads the events of one run: from Temporal while Temporal has
 // it, else from its export.
-func (s *Store) runEvents(ctx context.Context, t route.Target, runID, export string) ([]history.Event, error) {
+func (s *Store) runEvents(ctx context.Context, t route.Target, stream, runID, export string) ([]history.Event, error) {
 	events, err := history.FromTemporal(ctx, s.clientFor(t), t.WorkflowID, runID)
 	if err != nil {
 		if !isNotFound(err) {
@@ -92,7 +92,7 @@ func (s *Store) runEvents(ctx context.Context, t route.Target, runID, export str
 			return nil, protocol.NewError(protocol.Unavailable, "The plugin cannot read the export of run %s: %v", runID, err)
 		}
 	}
-	out, err := history.FromHistory(events, s.dcFor(t))
+	out, err := history.FromHistory(events, s.dcFor(t), stream)
 	if err != nil {
 		return nil, protocol.NewError(protocol.Unavailable, "The plugin cannot read the history of run %s: %v", runID, err)
 	}
@@ -123,6 +123,10 @@ func (s *Store) Read(ctx context.Context, p protocol.EventsReadParams) (protocol
 	st, err := s.streamState(ctx, t)
 	if err != nil {
 		return protocol.EventsReadResult{}, err
+	}
+	if st != nil && st.chain.Stream != "" && st.chain.Stream != p.Stream {
+		// The workflow holds another stream: this stream has no event.
+		st = nil
 	}
 	start := int64(1)
 	if st != nil {
@@ -160,7 +164,7 @@ func (s *Store) Read(ctx context.Context, p protocol.EventsReadParams) (protocol
 		if r.Legacy || r.LastSeq == 0 || r.LastSeq < start || !overlaps(r, p.From, p.To) {
 			continue
 		}
-		evs, err := s.runEvents(ctx, t, r.RunID, r.Export)
+		evs, err := s.runEvents(ctx, t, p.Stream, r.RunID, r.Export)
 		if err != nil {
 			return protocol.EventsReadResult{}, err
 		}
@@ -171,7 +175,7 @@ func (s *Store) Read(ctx context.Context, p protocol.EventsReadParams) (protocol
 		}
 	}
 	if !enough() && st.liveRun != "" {
-		evs, err := s.runEvents(ctx, t, st.liveRun, "")
+		evs, err := s.runEvents(ctx, t, p.Stream, st.liveRun, "")
 		if err != nil {
 			return protocol.EventsReadResult{}, err
 		}

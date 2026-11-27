@@ -35,12 +35,22 @@ const (
 const (
 	QueryDoc  = "doc"
 	QueryInfo = "info"
+	// QueryDocKeys gives the collection and key of each document. The
+	// ExportRun activity uses it to read a large state one document at a time.
+	QueryDocKeys = "docKeys"
 )
+
+// QueryStarting is the error text of a query that comes while a run loads
+// its state. The store sends the query again.
+const QueryStarting = "plugin-temporal: the run is starting"
 
 // The update and query names of the catalog workflow.
 const (
 	UpdateCatalogPut = "catalogPut"
 	QueryCatalogPage = "page"
+	// QueryCatalogEntries gives a page of every entry, tombstones too, for
+	// the SaveCatalog activity.
+	QueryCatalogEntries = "entries"
 )
 
 // The activity names.
@@ -49,6 +59,8 @@ const (
 	ActivityExportRun     = "ExportRun"
 	ActivityDeleteExports = "DeleteExports"
 	ActivityLoadState     = "LoadState"
+	ActivitySaveCatalog   = "SaveCatalog"
+	ActivityLoadCatalog   = "LoadCatalog"
 )
 
 // The types of the application errors that a validator or a handler gives.
@@ -174,6 +186,8 @@ type EntityInput struct {
 	RunLimit    int    `json:"runLimit,omitempty"`
 	// IdleMs is the time with no update after which a run with no document ends.
 	IdleMs int64 `json:"idleMs,omitempty"`
+	// InlineBytes overrides InlineStateBytes (tests only).
+	InlineBytes int `json:"inlineBytes,omitempty"`
 	// Handoff is set by a relay workflow that continues as new into this one.
 	Handoff *HandoffInput `json:"handoff,omitempty"`
 }
@@ -280,12 +294,19 @@ type CatalogEntry struct {
 type CatalogInput struct {
 	Collection string                  `json:"collection"`
 	Entries    map[string]CatalogEntry `json:"entries,omitempty"`
-	RunLimit   int                     `json:"runLimit,omitempty"`
+	// EntriesObject names the entries in the blob store, when they were too
+	// large for this input.
+	EntriesObject string `json:"entriesObject,omitempty"`
+	RunLimit      int    `json:"runLimit,omitempty"`
+	// InlineBytes overrides InlineStateBytes (tests only).
+	InlineBytes int `json:"inlineBytes,omitempty"`
 }
 
 // CatalogPutInput is the input of the catalog's update and of the
 // CatalogPut activity.
 type CatalogPutInput struct {
+	// Bound binds the input to the catalog workflow (set by the CatalogPut activity).
+	Bound      Bound        `json:"bound"`
 	Collection string       `json:"collection"`
 	Key        string       `json:"key"`
 	Entry      CatalogEntry `json:"entry"`
@@ -318,8 +339,9 @@ type ExportInput struct {
 	// Chain is the chain with the run in it. The activity writes it as the
 	// manifest after the export.
 	Chain Chain `json:"chain"`
-	// Docs are written to the blob store too when StateObject is set.
-	Docs        []Doc  `json:"docs,omitempty"`
+	// StateObject is set when the documents are too large for the
+	// continue-as-new input: the activity reads them from the run with
+	// queries, one at a time, and writes them encrypted to this object.
 	StateObject string `json:"stateObject,omitempty"`
 	// SkipHistory is true when the run has nothing to export (it never held
 	// data); only the manifest is written.
@@ -330,4 +352,43 @@ type ExportInput struct {
 type DeleteExportsInput struct {
 	Exports []string `json:"exports"`
 	Chain   Chain    `json:"chain"`
+}
+
+// DocRef names one document.
+type DocRef struct {
+	Collection string `json:"collection"`
+	Key        string `json:"key"`
+}
+
+// LoadStateInput asks for one document of a state object.
+type LoadStateInput struct {
+	Name  string `json:"name"`
+	Index int    `json:"index"`
+}
+
+// LoadStateResult is one document of a state object, and the count.
+type LoadStateResult struct {
+	Doc   *Doc `json:"doc,omitempty"`
+	Count int  `json:"count"`
+}
+
+// EntriesQuery is the input of the catalog's entries query.
+type EntriesQuery struct {
+	After string `json:"after"`
+	Limit int    `json:"limit"`
+}
+
+// SaveCatalogInput is the input of the SaveCatalog activity: it reads the
+// entries of the run with queries and writes them encrypted to Name.
+type SaveCatalogInput struct {
+	WorkflowID string `json:"workflowId"`
+	RunID      string `json:"runId"`
+	Name       string `json:"name"`
+}
+
+// LoadCatalogInput asks for one page of a saved catalog.
+type LoadCatalogInput struct {
+	Name  string `json:"name"`
+	After string `json:"after"`
+	Limit int    `json:"limit"`
 }

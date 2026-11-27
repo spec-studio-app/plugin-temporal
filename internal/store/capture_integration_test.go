@@ -24,15 +24,28 @@ func TestCaptureHistories(t *testing.T) {
 	if os.Getenv("CAPTURE_HISTORIES") != "1" {
 		t.Skip("CAPTURE_HISTORIES is not 1")
 	}
+	// The name of the workflow shape, for example v2. The files of earlier
+	// shapes stay: they must still replay.
+	prefix := os.Getenv("CAPTURE_NAME")
+	if prefix == "" {
+		t.Fatal("CAPTURE_NAME is not set (for example v2)")
+	}
+	for _, n := range []string{"entity-run1", "entity-run2", "catalog-specs"} {
+		if _, err := os.Stat(filepath.Join("../workflows/testdata/histories", prefix+"-"+n+".json")); err == nil {
+			t.Fatalf("the histories %s-* exist already: choose a new CAPTURE_NAME", prefix)
+		}
+	}
 	keys, err := os.ReadFile("../workflows/testdata/replay-keys.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := newEnv(t)
 	e.settings["payload_keys"] = strings.TrimSpace(string(keys))
-	e.settings["deploy_id"] = "replay"
+	// A deploy ID of its own: workflows of an earlier capture must not take part.
+	deploy := "replay" + randomHex(4)
+	e.settings["deploy_id"] = deploy
 	s := e.open(Options{})
-	key, stream := "1a2b3c4d5e6f:replay-"+randomHex(3), ""
+	key, stream := "1a2b3c4d5e6f:replay", ""
 	stream = "spec:" + key
 
 	v1 := put(t, s, "specs", key, map[string]any{"n": 1}, map[string]any{"open": true}, nil).Version
@@ -61,14 +74,16 @@ func TestCaptureHistories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wf := "spec-replay-" + strings.ReplaceAll(key, ":", "-")
+	wf := "spec-" + deploy + "-" + strings.ReplaceAll(key, ":", "-")
 	rc := raw(t)
-	save(t, "entity-run1.json", historyOf(t, rc, wf, firstRun))
-	save(t, "entity-run2.json", historyOf(t, rc, wf, ""))
-	save(t, "catalog-specs.json", historyOf(t, rc, "catalog/replay/specs", ""))
+	save(t, prefix+"-entity-run1.json", wf, historyOf(t, rc, wf, firstRun))
+	save(t, prefix+"-entity-run2.json", wf, historyOf(t, rc, wf, ""))
+	save(t, prefix+"-catalog-specs.json", "catalog/"+deploy+"/specs", historyOf(t, rc, "catalog/"+deploy+"/specs", ""))
 }
 
-func save(t *testing.T, name string, events []*historypb.HistoryEvent) {
+// save writes a history, and its workflow ID next to it (<name>.id): the
+// workflows check their input against their workflow ID, so the replay needs it.
+func save(t *testing.T, name, workflowID string, events []*historypb.HistoryEvent) {
 	t.Helper()
 	b, err := temporalproto.CustomJSONMarshalOptions{Indent: " "}.Marshal(&historypb.History{Events: events})
 	if err != nil {
@@ -79,6 +94,9 @@ func save(t *testing.T, name string, events []*historypb.HistoryEvent) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join("../workflows/testdata/histories", name), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("../workflows/testdata/histories", strings.TrimSuffix(name, ".json")+".id"), []byte(workflowID+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

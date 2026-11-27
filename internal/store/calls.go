@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"time"
 
@@ -157,7 +158,7 @@ func (s *Store) startUpdate(ctx context.Context, t route.Target, name string, ar
 		return protocol.NewError(protocol.Unavailable, "The plugin cannot read the chain of %s from the blob store.", t.WorkflowID)
 	}
 	c := s.clientFor(t)
-	in := workflows.EntityInput{Chain: chain, RunLimit: s.opts.RunLimit, IdleMs: s.opts.Idle.Milliseconds()}
+	in := workflows.EntityInput{Chain: chain, RunLimit: s.opts.RunLimit, IdleMs: s.opts.Idle.Milliseconds(), InlineBytes: s.opts.InlineBytes}
 	op := c.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
 		ID:                       t.WorkflowID,
 		TaskQueue:                t.TaskQueue,
@@ -180,19 +181,53 @@ func (s *Store) startUpdate(ctx context.Context, t route.Target, name string, ar
 }
 
 // query runs a query on the latest run. It returns errNotRunning when the
-// workflow does not exist.
+// workflow does not exist, or when its latest run is a closed run of another
+// workflow type (a relay workflow that ended before the handoff: no worker
+// of this plugin can answer for it, and it holds no plugin document). It
+// asks again while the run loads its state.
 func (s *Store) query(ctx context.Context, t route.Target, name string, out any, args ...any) error {
-	v, err := s.clientFor(t).QueryWorkflow(ctx, t.WorkflowID, "", name, args...)
-	if err != nil {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callTimeout)
+		defer cancel()
+	}
+	delay := 50 * time.Millisecond
+	for {
+		v, err := s.clientFor(t).QueryWorkflow(ctx, t.WorkflowID, "", name, args...)
+		if err == nil {
+			if err := v.Get(out); err != nil {
+				return unavailable(err)
+			}
+			return nil
+		}
 		if isNotFound(err) {
 			return errNotRunning
 		}
-		return unavailable(err)
+		if !strings.Contains(err.Error(), workflows.QueryStarting) {
+			if foreign, derr := s.closedForeign(ctx, t); derr == nil && foreign {
+				return errNotRunning
+			}
+			return unavailable(err)
+		}
+		select {
+		case <-ctx.Done():
+			return unavailable(ctx.Err())
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, time.Second)
 	}
-	if err := v.Get(out); err != nil {
-		return unavailable(err)
+}
+
+// closedForeign is true when the latest run is closed and is not a run of
+// this plugin's workflow types.
+func (s *Store) closedForeign(ctx context.Context, t route.Target) (bool, error) {
+	d, err := s.clientFor(t).DescribeWorkflowExecution(ctx, t.WorkflowID, "")
+	if err != nil {
+		return false, err
 	}
-	return nil
+	info := d.GetWorkflowExecutionInfo()
+	ty := info.GetType().GetName()
+	return info.GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING && ty != workflows.EntityWorkflow && ty != workflows.CatalogWorkflow, nil
 }
 
 // running is true when the workflow has a running run.

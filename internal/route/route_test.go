@@ -36,9 +36,19 @@ func TestRelayIDs(t *testing.T) {
 }
 
 func TestNoCollisions(t *testing.T) {
-	a := r.Doc("a-b", "c")
-	b := r.Doc("a", "b-c")
-	if a.WorkflowID == b.WorkflowID {
-		t.Fatalf("two documents share the workflow %s", a.WorkflowID)
+	pairs := [][2]Target{
+		{r.Doc("a-b", "c"), r.Doc("a", "b-c")},
+		{r.Stream("spec:a-b:c"), r.Stream("spec:a:b-c")},
+		{r.Doc("specs", "a-b:c"), r.Doc("specs", "a:b-c")},
+		{r.Doc("desks", "a-b"), r.Doc("desks", "a")},
+	}
+	for _, p := range pairs {
+		if p[0].WorkflowID == p[1].WorkflowID {
+			t.Fatalf("two names share the workflow %s", p[0].WorkflowID)
+		}
+	}
+	// Only a 12-hex repo key gets the relay's IDs.
+	if r.Doc("specs", "a-b:c").Kind != KindDoc || r.Stream("desk:a-b").Kind != KindStream {
+		t.Fatal("a key that is not a relay repo key gets a relay ID")
 	}
 }

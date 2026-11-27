@@ -209,3 +209,12 @@ func TestHandoff(t *testing.T) {
 		t.Fatalf("doc: %+v", doc)
 	}
 }
+
+// A continue-as-new input copied from another workflow ends the run with no data.
+func TestCopiedChain(t *testing.T) {
+	h := newHarness(t)
+	h.env.ExecuteWorkflow(EntityWorkflow, EntityInput{Chain: &Chain{WorkflowID: "spec-test-other-x", Nonce: "abc", NextSeq: 4}, Docs: []Doc{{Collection: "specs", Key: "other:x", Value: json.RawMessage(`1`)}}})
+	if !h.env.IsWorkflowCompleted() || h.env.GetWorkflowError() != nil || len(h.exports) != 0 {
+		t.Fatalf("the run took a copied chain: %v", h.env.GetWorkflowError())
+	}
+}

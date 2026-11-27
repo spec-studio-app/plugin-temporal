@@ -2,10 +2,15 @@ package workflows
 
 import (
 	"encoding/json"
+	"errors"
 	"sort"
+	"strings"
 	"time"
 
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
+
+	"github.com/spec-studio-app/plugin-temporal/internal/blobstore"
 )
 
 // tombstoneAge is how long a deleted key stays as a tombstone, so that a
@@ -38,8 +43,23 @@ func Matches(attrs, filter map[string]any) bool {
 	return true
 }
 
+// catalogPageSize is the most entries in one SaveCatalog query or one
+// LoadCatalog result (each entry is a few hundred bytes).
+const catalogPageSize = 1000
+
 // Catalog is the catalog workflow: the list index of one collection.
 func Catalog(ctx workflow.Context, in CatalogInput) error {
+	info := workflow.GetInfo(ctx)
+	wfID := info.WorkflowExecution.ID
+	// A start input copied from another collection's catalog: end at once.
+	if !strings.HasSuffix(wfID, "/"+in.Collection) {
+		workflow.GetLogger(ctx).Warn("The start input is for another catalog. The run ends with no data.")
+		return nil
+	}
+	if in.EntriesObject != "" && !strings.HasPrefix(in.EntriesObject, blobstore.CatalogPrefix(wfID)) {
+		workflow.GetLogger(ctx).Warn("The entries object of the start input is for another catalog. The run ends with no data.")
+		return nil
+	}
 	entries := in.Entries
 	if entries == nil {
 		entries = map[string]CatalogEntry{}
@@ -50,8 +70,13 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 	}
 	updates := 0
 	closing := false
+	ready := in.EntriesObject == ""
+	starting := errors.New(QueryStarting)
 
 	if err := workflow.SetQueryHandler(ctx, QueryCatalogPage, func(q PageQuery) (Page, error) {
+		if !ready {
+			return Page{}, starting
+		}
 		keys := make([]string, 0, len(entries))
 		for k, e := range entries {
 			if !e.Deleted && k > q.After && Matches(e.Attributes, q.Filter) {
@@ -75,6 +100,28 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 	}); err != nil {
 		return err
 	}
+	if err := workflow.SetQueryHandler(ctx, QueryCatalogEntries, func(q EntriesQuery) ([]PageItem, error) {
+		if !ready {
+			return nil, starting
+		}
+		keys := make([]string, 0, len(entries))
+		for k := range entries {
+			if k > q.After {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		out := []PageItem{}
+		for _, k := range keys {
+			if len(out) == q.Limit {
+				break
+			}
+			out = append(out, PageItem{Key: k, Entry: entries[k]})
+		}
+		return out, nil
+	}); err != nil {
+		return err
+	}
 
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateCatalogPut,
 		func(ctx workflow.Context, p CatalogPutInput) (bool, error) {
@@ -87,13 +134,41 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 			return true, nil
 		},
 		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, p CatalogPutInput) error {
+			if !ready {
+				return retryErr("The catalog is starting. Send the update again.")
+			}
 			if closing {
 				return retryErr("The catalog is closing. Send the update again.")
+			}
+			if err := checkBound(ctx, wfID, p.Bound); err != nil {
+				return err
+			}
+			if p.Collection != in.Collection {
+				return temporal.NewNonRetryableApplicationError("The entry is for another collection.", ErrBadInput, nil)
 			}
 			return nil
 		}},
 	); err != nil {
 		return err
+	}
+
+	// The entries of the last run from the blob store, one page per activity.
+	if in.EntriesObject != "" {
+		after := ""
+		for {
+			var page []PageItem
+			if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityLoadCatalog, LoadCatalogInput{Name: in.EntriesObject, After: after, Limit: catalogPageSize}).Get(ctx, &page); err != nil {
+				return err
+			}
+			for _, it := range page {
+				entries[it.Key] = it.Entry
+				after = it.Key
+			}
+			if len(page) < catalogPageSize {
+				break
+			}
+		}
+		ready = true
 	}
 
 	if err := workflow.Await(ctx, func() bool {
@@ -106,10 +181,31 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 		return err
 	}
 	now := workflow.Now(ctx)
+	size := 0
 	for k, e := range entries {
 		if e.Deleted && now.Sub(e.UpdatedAt) > tombstoneAge {
 			delete(entries, k)
+			continue
+		}
+		size += len(k) + 256
+		for ak := range e.Attributes {
+			size += len(ak) + 32
 		}
 	}
-	return workflow.NewContinueAsNewError(ctx, CatalogWorkflow, CatalogInput{Collection: in.Collection, Entries: entries, RunLimit: in.RunLimit})
+	next := CatalogInput{Collection: in.Collection, RunLimit: in.RunLimit, InlineBytes: in.InlineBytes}
+	limit := InlineStateBytes
+	if in.InlineBytes > 0 {
+		limit = in.InlineBytes
+	}
+	if size > limit {
+		// Too large for the continue-as-new input: the activity reads the
+		// entries with queries and writes them encrypted to the blob store.
+		next.EntriesObject = blobstore.CatalogName(wfID, info.WorkflowExecution.RunID)
+		if err := workflow.ExecuteActivity(exportCtx(ctx), ActivitySaveCatalog, SaveCatalogInput{WorkflowID: wfID, RunID: info.WorkflowExecution.RunID, Name: next.EntriesObject}).Get(ctx, nil); err != nil {
+			return err
+		}
+	} else {
+		next.Entries = entries
+	}
+	return workflow.NewContinueAsNewError(ctx, CatalogWorkflow, next)
 }

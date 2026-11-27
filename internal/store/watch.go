@@ -28,12 +28,32 @@ func remaining(ctx context.Context) time.Duration {
 	return time.Minute
 }
 
+// checkCtx gives a short context for the one check of a wait whose own
+// timeout is too short for an update: the protocol says that a wait whose
+// condition is true already ends at once with changed true.
+func checkCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 5*time.Second)
+}
+
 func (s *Store) waitDoc(ctx context.Context, p protocol.WatchWaitParams) (protocol.WatchWaitResult, error) {
 	t := s.router.Doc(p.Collection, p.Key)
 	changedTo := func(v *string) protocol.WatchWaitResult { return protocol.WatchWaitResult{Changed: true, Version: v} }
 	for {
 		left := remaining(ctx)
 		if left <= 50*time.Millisecond || ctx.Err() != nil {
+			c, cancel := checkCtx()
+			defer cancel()
+			d, err := s.getDoc(c, p.Collection, p.Key)
+			if err != nil {
+				return protocol.WatchWaitResult{Changed: false}, nil
+			}
+			var v *string
+			if d != nil {
+				v = &d.Version
+			}
+			if (v == nil) != (p.Version == nil) || (v != nil && *v != *p.Version) {
+				return changedTo(v), nil
+			}
 			return protocol.WatchWaitResult{Changed: false}, nil
 		}
 		var res workflows.WaitResult
@@ -71,7 +91,13 @@ func (s *Store) waitStream(ctx context.Context, p protocol.WatchWaitParams) (pro
 	t := s.router.Stream(p.Stream)
 	var after int64
 	if p.After != nil {
-		st, err := s.streamState(ctx, t)
+		c := ctx
+		if remaining(ctx) <= 50*time.Millisecond {
+			var cancel context.CancelFunc
+			c, cancel = checkCtx()
+			defer cancel()
+		}
+		st, err := s.streamState(c, t)
 		if err != nil {
 			return protocol.WatchWaitResult{}, err
 		}
@@ -84,6 +110,17 @@ func (s *Store) waitStream(ctx context.Context, p protocol.WatchWaitParams) (pro
 	for {
 		left := remaining(ctx)
 		if left <= 50*time.Millisecond || ctx.Err() != nil {
+			c, cancel := checkCtx()
+			defer cancel()
+			st, err := s.streamState(c, t)
+			if err != nil || st == nil || (st.chain.Stream != "" && st.chain.Stream != p.Stream) {
+				return protocol.WatchWaitResult{Changed: false}, nil
+			}
+			last := st.chain.NextSeq - 1
+			if last >= st.chain.KeptFrom && last > after {
+				cur := history.Cursor(st.chain.Nonce, last)
+				return protocol.WatchWaitResult{Changed: true, Cursor: &cur}, nil
+			}
 			return protocol.WatchWaitResult{Changed: false}, nil
 		}
 		var res workflows.WaitResult

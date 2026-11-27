@@ -4,8 +4,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -26,9 +28,10 @@ type entity struct {
 	// updates counts the accepted updates of this run (for the run limit).
 	updates int
 	// activity counts every accepted update, for the idle time.
-	activity int
-	runLimit int
-	idle     time.Duration
+	activity    int
+	runLimit    int
+	idle        time.Duration
+	inlineBytes int
 	// ready is false while the run starts (handoff, state load).
 	ready bool
 	// closing is true from the moment the run starts to end: every
@@ -156,7 +159,22 @@ func Entity(ctx workflow.Context, in EntityInput) error {
 		log.Warn("The handoff input is for another workflow. The run ends with no data.")
 		return nil
 	}
+	// The same for a continue-as-new input: a run gives its chain and its
+	// documents only to a run of its own workflow.
+	if in.Chain != nil && in.Chain.WorkflowID != "" && in.Chain.WorkflowID != e.wfID {
+		log.Warn("The start input is for another workflow. The run ends with no data.")
+		return nil
+	}
+	if (len(in.Docs) > 0 || in.StateObject != "") && in.Chain == nil {
+		log.Warn("The start input has documents but no chain. The run ends with no data.")
+		return nil
+	}
+	if in.StateObject != "" && !strings.HasPrefix(in.StateObject, blobstore.StatePrefix(e.wfID)) {
+		log.Warn("The state object of the start input is for another workflow. The run ends with no data.")
+		return nil
+	}
 
+	e.inlineBytes = in.InlineBytes
 	e.runLimit = in.RunLimit
 	if e.runLimit <= 0 {
 		e.runLimit = DefaultRunLimit
@@ -198,14 +216,18 @@ func Entity(ctx workflow.Context, in EntityInput) error {
 
 	// The start: the documents of the last run from the blob store, then
 	// the handoff from a relay run.
+	// One document per activity, so no payload holds the whole state.
 	if in.StateObject != "" {
-		var docs []Doc
-		if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityLoadState, in.StateObject).Get(ctx, &docs); err != nil {
-			return err
-		}
-		for i := range docs {
-			d := docs[i]
-			e.docs[docKey(d.Collection, d.Key)] = &d
+		for i, count := 0, 1; i < count; i++ {
+			var res LoadStateResult
+			if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityLoadState, LoadStateInput{Name: in.StateObject, Index: i}).Get(ctx, &res); err != nil {
+				return err
+			}
+			count = res.Count
+			if res.Doc != nil {
+				d := *res.Doc
+				e.docs[docKey(d.Collection, d.Key)] = &d
+			}
 		}
 	}
 	if in.Handoff != nil {
@@ -245,7 +267,14 @@ func (e *entity) handoff(ctx workflow.Context, h *HandoffInput, prevRunID string
 }
 
 func (e *entity) handlers(ctx workflow.Context) error {
+	// Until the run has its documents, a query fails with QueryStarting,
+	// and the store asks again: an empty answer would say that a document
+	// does not exist.
+	starting := errors.New(QueryStarting)
 	if err := workflow.SetQueryHandler(ctx, QueryDoc, func(collection, key string) (*Doc, error) {
+		if !e.ready {
+			return nil, starting
+		}
 		if d, ok := e.docs[docKey(collection, key)]; ok {
 			c := *d
 			return &c, nil
@@ -254,7 +283,24 @@ func (e *entity) handlers(ctx workflow.Context) error {
 	}); err != nil {
 		return err
 	}
-	if err := workflow.SetQueryHandler(ctx, QueryInfo, func() (Info, error) { return e.info(), nil }); err != nil {
+	if err := workflow.SetQueryHandler(ctx, QueryInfo, func() (Info, error) {
+		if !e.ready {
+			return Info{}, starting
+		}
+		return e.info(), nil
+	}); err != nil {
+		return err
+	}
+	if err := workflow.SetQueryHandler(ctx, QueryDocKeys, func() ([]DocRef, error) {
+		if !e.ready {
+			return nil, starting
+		}
+		refs := []DocRef{}
+		for _, d := range e.sortedDocs() {
+			refs = append(refs, DocRef{Collection: d.Collection, Key: d.Key})
+		}
+		return refs, nil
+	}); err != nil {
 		return err
 	}
 
@@ -490,16 +536,21 @@ func (e *entity) close(ctx workflow.Context, end bool) error {
 	} else {
 		in.SkipHistory = true
 	}
-	next := EntityInput{Chain: nil, RunLimit: e.runLimit, IdleMs: e.idle.Milliseconds()}
+	next := EntityInput{Chain: nil, RunLimit: e.runLimit, IdleMs: e.idle.Milliseconds(), InlineBytes: e.inlineBytes}
 	docs := e.sortedDocs()
 	if !end {
 		size := 0
 		for _, d := range docs {
 			size += len(d.Value) + 256
 		}
-		if size > InlineStateBytes {
+		limit := InlineStateBytes
+		if e.inlineBytes > 0 {
+			limit = e.inlineBytes
+		}
+		if size > limit {
+			// The activity reads the documents from this run with queries.
 			next.StateObject = blobstore.StateName(e.wfID, e.runID)
-			in.Docs, in.StateObject = docs, next.StateObject
+			in.StateObject = next.StateObject
 		} else {
 			next.Docs = docs
 		}

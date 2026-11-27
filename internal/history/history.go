@@ -36,8 +36,8 @@ type Event struct {
 	Data json.RawMessage
 }
 
-// FromHistory finds the events in a run's history events.
-func FromHistory(events []*historypb.HistoryEvent, dc converter.DataConverter) ([]Event, error) {
+// FromHistory finds the events of one stream in a run's history events.
+func FromHistory(events []*historypb.HistoryEvent, dc converter.DataConverter, stream string) ([]Event, error) {
 	inputs := map[string]workflows.AppendInput{}
 	var out []Event
 	for _, ev := range events {
@@ -51,6 +51,9 @@ func FromHistory(events []*historypb.HistoryEvent, dc converter.DataConverter) (
 			var in workflows.AppendInput
 			if err := dc.FromPayloads(req.GetInput().GetArgs(), &in); err != nil {
 				return nil, fmt.Errorf("cannot read the append update of event %d: %w", ev.GetEventId(), err)
+			}
+			if in.Stream != stream {
+				continue
 			}
 			inputs[req.GetMeta().GetUpdateId()] = in
 		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED:

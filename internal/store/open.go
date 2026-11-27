@@ -38,6 +38,8 @@ type Options struct {
 	RunLimit        int
 	Idle            time.Duration
 	CatalogRunLimit int
+	// InlineBytes is the largest state in a continue-as-new input (tests only).
+	InlineBytes int
 }
 
 // Store is the plugin's storage.
@@ -154,11 +156,12 @@ func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
 	for _, wk := range []struct {
 		c  client.Client
 		tq string
-	}{{s.data, set.TaskQueue}, {s.config, set.ConfigTaskQueue}} {
+		dc converter.DataConverter
+	}{{s.data, set.TaskQueue, s.dataDC}, {s.config, set.ConfigTaskQueue, s.configDC}} {
 		w := worker.New(wk.c, wk.tq, worker.Options{})
 		w.RegisterWorkflowWithOptions(workflows.Entity, workflow.RegisterOptions{Name: workflows.EntityWorkflow})
 		w.RegisterWorkflowWithOptions(workflows.Catalog, workflow.RegisterOptions{Name: workflows.CatalogWorkflow})
-		a := &activities.Activities{Client: wk.c, Blobs: s.blobs, Router: s.router, CatalogRunLimit: s.opts.CatalogRunLimit}
+		a := &activities.Activities{Client: wk.c, DC: wk.dc, Blobs: s.blobs, Router: s.router, CatalogRunLimit: s.opts.CatalogRunLimit, InlineBytes: s.opts.InlineBytes}
 		a.Register(w)
 		if err := w.Start(); err != nil {
 			s.stopWorkers()

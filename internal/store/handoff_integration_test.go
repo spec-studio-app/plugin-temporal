@@ -93,7 +93,7 @@ func TestHandoffEndToEnd(t *testing.T) {
 		}
 		if _, err := raw(t).WorkflowService().DeleteWorkflowExecution(ctx(t), &workflowservice.DeleteWorkflowExecutionRequest{
 			Namespace: "default", WorkflowExecution: &commonpb.WorkflowExecution{WorkflowId: w.WorkflowID, RunId: w.RelayRunID},
-		}); err != nil {
+		}); err != nil && !isNotFound(err) {
 			t.Fatal(err)
 		}
 		export := filepath.Join(e.blobDir, filepath.FromSlash(blobstore.ExportName(w.WorkflowID, w.RelayRunID)))

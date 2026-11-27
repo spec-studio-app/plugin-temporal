@@ -12,14 +12,19 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"time"
 
+	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/temporalproto"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/spec-studio-app/plugin-temporal/internal/blobstore"
 	"github.com/spec-studio-app/plugin-temporal/internal/route"
@@ -29,10 +34,15 @@ import (
 // Activities are the activities of one worker.
 type Activities struct {
 	Client client.Client
+	// DC is the data converter of the worker's scope (with the codec). The
+	// state and catalog objects are encrypted with it.
+	DC     converter.DataConverter
 	Blobs  blobstore.Store
 	Router route.Router
 	// CatalogRunLimit is the run limit of new catalogs (0: the default).
 	CatalogRunLimit int
+	// InlineBytes is the inline state limit of new catalogs (tests only).
+	InlineBytes int
 }
 
 // Register adds the activities to a worker.
@@ -41,6 +51,8 @@ func (a *Activities) Register(w worker.Worker) {
 	w.RegisterActivityWithOptions(a.ExportRun, activity.RegisterOptions{Name: workflows.ActivityExportRun})
 	w.RegisterActivityWithOptions(a.DeleteExports, activity.RegisterOptions{Name: workflows.ActivityDeleteExports})
 	w.RegisterActivityWithOptions(a.LoadState, activity.RegisterOptions{Name: workflows.ActivityLoadState})
+	w.RegisterActivityWithOptions(a.SaveCatalog, activity.RegisterOptions{Name: workflows.ActivitySaveCatalog})
+	w.RegisterActivityWithOptions(a.LoadCatalog, activity.RegisterOptions{Name: workflows.ActivityLoadCatalog})
 }
 
 // CatalogPut puts an entry in the catalog of its collection. It starts the
@@ -51,7 +63,8 @@ func (a *Activities) CatalogPut(ctx context.Context, in workflows.CatalogPutInpu
 		ID:                       t.WorkflowID,
 		TaskQueue:                t.TaskQueue,
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-	}, workflows.CatalogWorkflow, workflows.CatalogInput{Collection: in.Collection, RunLimit: a.CatalogRunLimit})
+	}, workflows.CatalogWorkflow, workflows.CatalogInput{Collection: in.Collection, RunLimit: a.CatalogRunLimit, InlineBytes: a.InlineBytes})
+	in.Bound = workflows.Bound{Target: t.WorkflowID, AtMs: time.Now().UnixMilli()}
 	h, err := a.Client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
 		UpdateOptions: client.UpdateWorkflowOptions{
@@ -86,7 +99,7 @@ func (a *Activities) ExportRun(ctx context.Context, in workflows.ExportInput) (s
 		}
 	}
 	if in.StateObject != "" {
-		if err := a.putJSON(ctx, in.StateObject, in.Docs); err != nil {
+		if err := a.saveState(ctx, in); err != nil {
 			return "", err
 		}
 	}
@@ -167,21 +180,140 @@ func (a *Activities) putJSON(ctx context.Context, name string, v any) error {
 	return a.Blobs.PutObject(ctx, name, bytesReader(b), int64(len(b)))
 }
 
-// LoadState reads the documents that the last run wrote to the blob store.
-func (a *Activities) LoadState(ctx context.Context, name string) ([]workflows.Doc, error) {
+// queryRun runs a query on one run, and asks again while the run starts.
+func (a *Activities) queryRun(ctx context.Context, workflowID, runID, name string, out any, args ...any) error {
+	for {
+		v, err := a.Client.QueryWorkflow(ctx, workflowID, runID, name, args...)
+		if err == nil {
+			return v.Get(out)
+		}
+		if !strings.Contains(err.Error(), workflows.QueryStarting) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
+
+// writeSealed writes items as Temporal payloads, encrypted by the scope's
+// codec, so a state or catalog object in the blob store is never plain.
+func (a *Activities) writeSealed(ctx context.Context, name string, items []any) error {
+	ps := &commonpb.Payloads{}
+	for _, it := range items {
+		p, err := a.DC.ToPayload(it)
+		if err != nil {
+			return fmt.Errorf("cannot encrypt an item of %s", name)
+		}
+		ps.Payloads = append(ps.Payloads, p)
+	}
+	b, err := proto.Marshal(ps)
+	if err != nil {
+		return err
+	}
+	return a.Blobs.PutObject(ctx, name, bytesReader(b), int64(len(b)))
+}
+
+// readSealed reads an object that writeSealed wrote.
+func (a *Activities) readSealed(ctx context.Context, name string) ([]*commonpb.Payload, error) {
 	r, err := a.Blobs.GetObject(ctx, name)
 	if errors.Is(err, blobstore.ErrNotFound) {
-		return nil, temporal.NewNonRetryableApplicationError("The state of the last run is not in the blob store.", "state_missing", nil)
+		return nil, temporal.NewNonRetryableApplicationError("The object "+name+" is not in the blob store.", "object_missing", nil)
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	var docs []workflows.Doc
-	if err := json.NewDecoder(r).Decode(&docs); err != nil {
+	b, err := io.ReadAll(r)
+	if err != nil {
 		return nil, err
 	}
-	return docs, nil
+	ps := &commonpb.Payloads{}
+	if err := proto.Unmarshal(b, ps); err != nil {
+		return nil, temporal.NewNonRetryableApplicationError("The object "+name+" is not valid.", "object_bad", nil)
+	}
+	return ps.Payloads, nil
+}
+
+// saveState reads the documents of the closing run one at a time with
+// queries, and writes them encrypted. No payload holds the whole state.
+func (a *Activities) saveState(ctx context.Context, in workflows.ExportInput) error {
+	var refs []workflows.DocRef
+	if err := a.queryRun(ctx, in.WorkflowID, in.RunID, workflows.QueryDocKeys, &refs); err != nil {
+		return err
+	}
+	items := make([]any, 0, len(refs))
+	for _, ref := range refs {
+		var d *workflows.Doc
+		if err := a.queryRun(ctx, in.WorkflowID, in.RunID, workflows.QueryDoc, &d, ref.Collection, ref.Key); err != nil {
+			return err
+		}
+		if d != nil {
+			items = append(items, *d)
+		}
+		activity.RecordHeartbeat(ctx, len(items))
+	}
+	return a.writeSealed(ctx, in.StateObject, items)
+}
+
+// LoadState gives one document of a state object, and the count.
+func (a *Activities) LoadState(ctx context.Context, in workflows.LoadStateInput) (workflows.LoadStateResult, error) {
+	ps, err := a.readSealed(ctx, in.Name)
+	if err != nil {
+		return workflows.LoadStateResult{}, err
+	}
+	res := workflows.LoadStateResult{Count: len(ps)}
+	if in.Index < len(ps) {
+		var d workflows.Doc
+		if err := a.DC.FromPayload(ps[in.Index], &d); err != nil {
+			return res, temporal.NewNonRetryableApplicationError("A document of the state object does not decrypt.", "object_bad", nil)
+		}
+		res.Doc = &d
+	}
+	return res, nil
+}
+
+// SaveCatalog reads every entry of a closing catalog run with queries, and
+// writes them encrypted.
+func (a *Activities) SaveCatalog(ctx context.Context, in workflows.SaveCatalogInput) error {
+	var items []any
+	after := ""
+	for {
+		var page []workflows.PageItem
+		if err := a.queryRun(ctx, in.WorkflowID, in.RunID, workflows.QueryCatalogEntries, &page, workflows.EntriesQuery{After: after, Limit: 1000}); err != nil {
+			return err
+		}
+		for _, it := range page {
+			items = append(items, it)
+			after = it.Key
+		}
+		activity.RecordHeartbeat(ctx, len(items))
+		if len(page) < 1000 {
+			break
+		}
+	}
+	return a.writeSealed(ctx, in.Name, items)
+}
+
+// LoadCatalog gives one page of a saved catalog, in key order after After.
+func (a *Activities) LoadCatalog(ctx context.Context, in workflows.LoadCatalogInput) ([]workflows.PageItem, error) {
+	ps, err := a.readSealed(ctx, in.Name)
+	if err != nil {
+		return nil, err
+	}
+	out := []workflows.PageItem{}
+	for _, p := range ps {
+		var it workflows.PageItem
+		if err := a.DC.FromPayload(p, &it); err != nil {
+			return nil, temporal.NewNonRetryableApplicationError("An entry of the catalog object does not decrypt.", "object_bad", nil)
+		}
+		if it.Key > in.After && len(out) < in.Limit {
+			out = append(out, it)
+		}
+	}
+	return out, nil
 }
 
 // DeleteExports removes exports and writes the manifest.

@@ -1,11 +1,13 @@
 package workflows
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
@@ -44,13 +46,33 @@ func histories(t *testing.T) []string {
 	return files
 }
 
+// replay replays one history file with its workflow ID (<file>.id).
+func replay(t *testing.T, r worker.WorkflowReplayer, file string) error {
+	t.Helper()
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := client.HistoryFromJSON(bytes.NewReader(raw), client.HistoryJSONOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := os.ReadFile(strings.TrimSuffix(file, ".json") + ".id")
+	if err != nil {
+		t.Fatalf("%s has no workflow ID file: %v", file, err)
+	}
+	return r.ReplayWorkflowHistoryWithOptions(nil, h, worker.ReplayWorkflowHistoryOptions{
+		OriginalExecution: workflow.Execution{ID: strings.TrimSpace(string(id)), RunID: "replay-run"},
+	})
+}
+
 // R11.S1: every stored history replays with the current code. A change that
 // gives other commands for a stored history fails here and names the file.
 // See scripts/capture-histories.sh.
 func TestReplay(t *testing.T) {
 	r := replayer(t, Entity)
 	for _, f := range histories(t) {
-		if err := r.ReplayWorkflowHistoryFromJSONFile(nil, f); err != nil {
+		if err := replay(t, r, f); err != nil {
 			t.Errorf("%s does not replay: %v", f, err)
 		}
 	}
@@ -67,7 +89,13 @@ func brokenEntity(ctx workflow.Context, in EntityInput) error {
 // The replay test catches a change that breaks determinism.
 func TestReplayCatchesBreak(t *testing.T) {
 	r := replayer(t, brokenEntity)
-	if err := r.ReplayWorkflowHistoryFromJSONFile(nil, "testdata/histories/entity-run1.json"); err == nil {
-		t.Fatal("a non-deterministic change replays")
+	files, _ := filepath.Glob("testdata/histories/*-entity-run1.json")
+	if len(files) == 0 {
+		t.Fatal("no entity history")
+	}
+	for _, f := range files {
+		if err := replay(t, r, f); err == nil {
+			t.Fatalf("a non-deterministic change replays %s", f)
+		}
 	}
 }

@@ -47,7 +47,23 @@ func ExportName(workflowID, runID string) string {
 // StateName is the object name of the documents that a run passes to the next
 // run, when they are too large for the continue-as-new input.
 func StateName(workflowID, runID string) string {
-	return "state/" + url.PathEscape(workflowID) + "/" + url.PathEscape(runID) + ".json"
+	return StatePrefix(workflowID) + url.PathEscape(runID) + ".bin"
+}
+
+// StatePrefix is the start of every state object name of a workflow.
+func StatePrefix(workflowID string) string {
+	return "state/" + url.PathEscape(workflowID) + "/"
+}
+
+// CatalogName is the object name of a catalog's entries that a run passes
+// to the next run.
+func CatalogName(workflowID, runID string) string {
+	return CatalogPrefix(workflowID) + url.PathEscape(runID) + ".bin"
+}
+
+// CatalogPrefix is the start of every catalog object name of a workflow.
+func CatalogPrefix(workflowID string) string {
+	return "catalog/" + url.PathEscape(workflowID) + "/"
 }
 
 // ChainName is the object name of a workflow's chain manifest.

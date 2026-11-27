@@ -1,19 +1,19 @@
 {
   "keys": "data:fx-d:kjCqy6sZlpuf/NwhYB7JMRNFcgiSgRDpr6ux/EtCA7c=,config:fx-c:xUH0kCfiUlPf66oGhDenQBg9B9x4DOWIsLEIjQZvr3k=",
-  "deployId": "fixture",
+  "deployId": "fixture664b9d",
   "workflows": [
     {
       "name": "spec",
-      "workflowId": "spec-fixture-3c7bdc395f84-fix-login",
-      "taskQueue": "relay-fixture",
+      "workflowId": "spec-fixture664b9d-3c7bdc395f84-fix-login",
+      "taskQueue": "relay-fixture664b9d",
       "scope": "data",
-      "relayRunId": "01a21d9b-ac30-7c29-8a07-416a2c6c8335",
+      "relayRunId": "01a21df6-11d0-78f1-93de-391c09afdaed",
       "documents": [
         {
           "collection": "specs",
           "key": "3c7bdc395f84:fix-login",
           "value": {
-            "deployId": "fixture",
+            "deployId": "fixture664b9d",
             "spec": {
               "repoKey": "3c7bdc395f84",
               "slug": "fix-login",
@@ -29,7 +29,7 @@
             },
             "turn": null,
             "line": 3,
-            "syncedAt": "2026-11-27T15:24:31.282Z",
+            "syncedAt": "2026-11-27T17:03:15.488Z",
             "events": [
               {
                 "line": 1,
@@ -59,7 +59,7 @@
               "nextSeq": 2,
               "messages": [
                 {
-                  "id": "0e78b1d6-94a2-494d-886e-723a96e9997e",
+                  "id": "f0b47f7b-e139-4deb-8b01-901409e049f2",
                   "seq": 1,
                   "from": "coordinator",
                   "spec": {
@@ -68,7 +68,7 @@
                   },
                   "stage": "",
                   "text": "How is it going?",
-                  "createdAt": "2026-11-27T15:24:31.305Z"
+                  "createdAt": "2026-11-27T17:03:15.499Z"
                 }
               ]
             },
@@ -96,30 +96,30 @@
             "lastStatusAt": "2026-11-27T10:02:00Z",
             "lastStatusLine": 3,
             "lastMessageLine": 2,
-            "lastSentAt": "2026-11-27T15:24:31.305Z"
+            "lastSentAt": "2026-11-27T17:03:15.499Z"
           },
           "attributes": {
             "repoKey": "3c7bdc395f84",
             "open": true,
             "pendingForMac": true,
             "pendingForCoordinator": true,
-            "deployId": "fixture"
+            "deployId": "fixture664b9d"
           }
         }
       ]
     },
     {
       "name": "desk",
-      "workflowId": "desk-fixture-3c7bdc395f84",
-      "taskQueue": "relay-fixture",
+      "workflowId": "desk-fixture664b9d-3c7bdc395f84",
+      "taskQueue": "relay-fixture664b9d",
       "scope": "data",
-      "relayRunId": "01a21d9b-ad0f-7772-b41d-837c0eaaa779",
+      "relayRunId": "01a21df6-123a-7c6f-aeba-b515c422d55c",
       "documents": [
         {
           "collection": "desks",
           "key": "3c7bdc395f84",
           "value": {
-            "deployId": "fixture",
+            "deployId": "fixture664b9d",
             "desk": {
               "repoKey": "3c7bdc395f84",
               "repo": "/Users/me/code/fixture-app"
@@ -131,13 +131,13 @@
             },
             "canMessage": true,
             "reason": null,
-            "stateAt": "2026-11-27T15:24:31.371Z",
+            "stateAt": "2026-11-27T17:03:15.511Z",
             "line": 0,
             "mac": {
               "nextSeq": 2,
               "messages": [
                 {
-                  "id": "323c963d-1e0f-45cf-ab19-745f0b52f925",
+                  "id": "da600d54-7e43-480d-b3b5-aeb889a7b1fa",
                   "seq": 1,
                   "from": "coordinator",
                   "desk": {
@@ -145,7 +145,7 @@
                     "repo": "/Users/me/code/fixture-app"
                   },
                   "text": "Is CI green on main?",
-                  "createdAt": "2026-11-27T15:24:31.429Z"
+                  "createdAt": "2026-11-27T17:03:15.545Z"
                 }
               ]
             },
@@ -160,23 +160,23 @@
             "repoKey": "3c7bdc395f84",
             "pendingForMac": true,
             "pendingForCoordinator": false,
-            "deployId": "fixture"
+            "deployId": "fixture664b9d"
           }
         }
       ]
     },
     {
       "name": "config",
-      "workflowId": "relay-config-fixture",
-      "taskQueue": "relay-fixture-config",
+      "workflowId": "relay-config-fixture664b9d",
+      "taskQueue": "relay-fixture664b9d-config",
       "scope": "config",
-      "relayRunId": "01a21d9b-ad6f-7da0-914c-9ffec9b29296",
+      "relayRunId": "01a21df6-1269-7416-97ca-f5ffaaefff7d",
       "documents": [
         {
           "collection": "relay",
           "key": "config",
           "value": {
-            "deployId": "fixture",
+            "deployId": "fixture664b9d",
             "agents": [
               {
                 "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

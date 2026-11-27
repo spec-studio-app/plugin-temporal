@@ -26,12 +26,15 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
   | `specs`, `app-specs` and `closed-specs` documents `<repoKey>:<slug>`, and the stream `spec:<repoKey>:<slug>` | `spec-<deploy_id>-<repoKey>-<slug>` | `<task_queue>` |
   | The `desks` document `<repoKey>`, and the stream `desk:<repoKey>` | `desk-<deploy_id>-<repoKey>` | `<task_queue>` |
   | The `relay` document `config` | `relay-config-<deploy_id>` | `<task_queue>-config` |
+  | Any other `relay` document | `doc/<deploy_id>/relay/<key>` | `<task_queue>-config` |
   | Any other document | `doc/<deploy_id>/<collection>/<key>` | `<task_queue>` |
   | Any other stream | `stream/<deploy_id>/<stream>` | `<task_queue>` |
 
+  A repo key gets the relay's IDs only when it has the relay's form: 12 lowercase hex digits. Any other key gets the generic ID of the last two rows.
+
 - Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes.
-- Each collection has a list workflow, `catalog/<deploy_id>/<collection>`. A list shows each write that returned.
-- The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The relay config uses the config key. All other workflows use the data key.
+- Each collection has a list workflow, `catalog/<deploy_id>/<collection>`. A list shows each write that returned. The list workflow of the `relay` collection is on `<task_queue>-config`.
+- The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The workflows of the `relay` collection (the relay config, other `relay` documents and their list workflow) use the config key. All other workflows use the data key.
 - The plugin never writes a key, a secret setting or a payload to its log, to an error or to a result.
 - It keeps blobs (files) in an S3-compatible bucket, or in a local folder.
 - The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker.
@@ -145,6 +148,8 @@ So that no event is lost:
 3. The run exports its own history to the blob store: `exports/<workflow ID>/<run ID>.json.gz`. The export is the Temporal JSON format (the format of `temporal workflow show --output json`), gzipped. The payloads stay encrypted, as Temporal keeps them.
 4. The run writes the chain of runs to `chains/<workflow ID>.json`, and gives the chain to the next run.
 
+When the documents of a run are larger than 512 KiB, they do not go into the next run's input. The run writes them to `state/<workflow ID>/<run ID>.bin`, one Temporal payload for each document, encrypted with the payload key. The next run reads them one at a time. A list workflow does the same with its entries (`catalog/<workflow ID>/<run ID>.bin`).
+
 The export comes before the run closes. So the retention never removes a run that has no export.
 
 A read follows the chain. It reads a run from Temporal while Temporal has the run, and from its export after that. The host never sees a run boundary. A write to a workflow that ended starts a new run, which reads the chain and links to it.
@@ -159,7 +164,7 @@ A relay that used its built-in Temporal store moves to this plugin with the same
 
 - Go 1.26 or later.
 - `go test ./...`: the unit tests, the workflow tests (the Temporal Go SDK test suite), and the replay tests.
-- The replay tests replay each history in `internal/workflows/testdata/histories`. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh`. Keep the old histories: they must still replay.
+- The replay tests replay each history in `internal/workflows/testdata/histories`. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh <name>`, for example `v2`. The script writes `<name>-*.json` and never replaces the files of an earlier shape: they must still replay.
 - The integration tests need a Temporal dev server, and for the bucket test an S3-compatible server:
 
   ```sh

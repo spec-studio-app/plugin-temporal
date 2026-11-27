@@ -7,7 +7,16 @@
 // choose a workflow: it applies no Spec Studio rule.
 package route
 
-import "strings"
+import (
+	"regexp"
+	"strings"
+)
+
+// repoKeyRE is the shape of the relay's repo keys: 12 lowercase hex digits.
+// Only a key of this shape gets the relay's spec and desk workflow IDs; any
+// other key gets a generic ID, so two names never share a workflow (the
+// relay's IDs join their parts with "-", which a name can hold).
+var repoKeyRE = regexp.MustCompile(`^[0-9a-f]{12}$`)
 
 // Scope is the payload key scope of a workflow.
 type Scope string
@@ -55,7 +64,7 @@ func (r Router) config(id, kind string) Target {
 // first ":" only, so a slug can hold ":" or "..".
 func (r Router) spec(key string) (Target, bool) {
 	repoKey, slug, ok := strings.Cut(key, ":")
-	if !ok || repoKey == "" || slug == "" {
+	if !ok || !repoKeyRE.MatchString(repoKey) || slug == "" {
 		return Target{}, false
 	}
 	return r.data("spec-"+r.DeployID+"-"+repoKey+"-"+slug, KindSpec), true
@@ -73,7 +82,9 @@ func (r Router) Doc(collection, key string) Target {
 			return t
 		}
 	case "desks":
-		return r.desk(key)
+		if repoKeyRE.MatchString(key) {
+			return r.desk(key)
+		}
 	case "relay":
 		if key == "config" {
 			return r.config("relay-config-"+r.DeployID, KindConfig)
@@ -91,7 +102,7 @@ func (r Router) Stream(stream string) Target {
 			return t
 		}
 	}
-	if rest, ok := strings.CutPrefix(stream, "desk:"); ok && rest != "" {
+	if rest, ok := strings.CutPrefix(stream, "desk:"); ok && repoKeyRE.MatchString(rest) {
 		return r.desk(rest)
 	}
 	return r.data("stream/"+r.DeployID+"/"+stream, KindStream)
