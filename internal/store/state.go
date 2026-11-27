@@ -58,6 +58,9 @@ func (s *Store) Delete(ctx context.Context, p protocol.StateDeleteParams) (proto
 	}
 	err := s.update(ctx, t, workflows.UpdateDelete, arg, &deleted, false)
 	if errors.Is(err, errNotRunning) {
+		if nerr := s.noDocument(ctx, t); nerr != nil {
+			return protocol.StateDeleteResult{}, nerr
+		}
 		return protocol.StateDeleteResult{}, protocol.NewError(protocol.NotFound, "The document does not exist.")
 	}
 	if err != nil {

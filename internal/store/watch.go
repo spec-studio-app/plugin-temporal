@@ -34,7 +34,7 @@ func remaining(ctx context.Context) time.Duration {
 // timeout is too short for an update: the protocol says that a wait whose
 // condition is true already ends at once with changed true.
 func checkCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 5*time.Second)
+	return context.WithTimeout(context.Background(), time.Second)
 }
 
 // docNow checks a document wait once, with its own short context: the
@@ -87,8 +87,16 @@ func (s *Store) streamNow(t route.Target, stream string, after int64, atTimeout 
 // waitTimedOut is true when a wait update ended because time ran out: the
 // host's deadline, or Temporal's own limit of a long update call. The loop
 // then checks again (once, at the host's deadline), and never gives an error.
+// pause waits a short time before a wait is sent again, or until ctx ends.
+func pause(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func waitTimedOut(ctx context.Context, err error) bool {
-	if ctx.Err() != nil || remaining(ctx) <= time.Second {
+	if ctx.Err() != nil {
 		return true
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -112,12 +120,17 @@ func (s *Store) waitDoc(ctx context.Context, p protocol.WatchWaitParams) (protoc
 		err := s.update(ctx, t, workflows.UpdateWait, arg, &res, p.Version == nil)
 		switch {
 		case errors.Is(err, errNotRunning):
-			// No run: the document does not exist, and the host has a version.
+			// No run: the document does not exist, and the host has a
+			// version. A failed or stopped run is not "no document".
+			if nerr := s.noDocument(ctx, t); nerr != nil {
+				return protocol.WatchWaitResult{}, nerr
+			}
 			return protocol.WatchWaitResult{Changed: true, Version: nil}, nil
 		case errors.Is(err, errReady):
 			return s.docNow(p, false)
 		case err != nil:
 			if waitTimedOut(ctx, err) {
+				pause(ctx)
 				continue
 			}
 			return protocol.WatchWaitResult{}, err
@@ -157,6 +170,7 @@ func (s *Store) waitStream(ctx context.Context, p protocol.WatchWaitParams) (pro
 			return s.streamNow(t, p.Stream, after, false)
 		case err != nil:
 			if waitTimedOut(ctx, err) {
+				pause(ctx)
 				continue
 			}
 			return protocol.WatchWaitResult{}, err

@@ -164,4 +164,14 @@ func TestTerminatedRunIsNotEmpty(t *testing.T) {
 	if (err == nil && !got.Exists) || (err != nil && !protocol.Is(err, protocol.Unavailable)) {
 		t.Fatalf("get after a stop: %+v %v", got, err)
 	}
+	if _, err := s.Delete(ctx(t), protocol.StateDeleteParams{Collection: "notes", Key: "term", ExpectedVersion: got.Version}); !protocol.Is(err, protocol.Unavailable) {
+		t.Fatalf("delete after a stop: %v", err)
+	}
+	c, cancel := ctxWithTimeout(3 * time.Second)
+	defer cancel()
+	v := got.Version
+	res, err := s.Wait(c, protocol.WatchWaitParams{Collection: "notes", Key: "term", Version: &v, TimeoutMs: 3000})
+	if err == nil && res.Changed && res.Version == nil {
+		t.Fatal("a wait after a stop says the document was deleted")
+	}
 }

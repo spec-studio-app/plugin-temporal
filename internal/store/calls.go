@@ -206,11 +206,16 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 		// A closed latest run holds no document: a relay run that ended
 		// before the handoff, a run that refused its input, or a run that
 		// ended with no data.
-		if closed, derr := s.closedRun(ctx, t); derr == nil && closed {
+		state, derr := s.runState(ctx, t)
+		if derr == nil && state == runEmpty {
 			return errNotRunning
 		}
 		if !strings.Contains(err.Error(), workflows.QueryStarting) {
 			return unavailable(err)
+		}
+		if derr == nil && state == runStopped {
+			// The run stopped while it loaded its state: it never becomes ready.
+			return protocol.NewError(protocol.Unavailable, "The workflow %s stopped while it loaded its state. Look at the workflow in Temporal.", t.WorkflowID)
 		}
 		select {
 		case <-ctx.Done():
@@ -221,26 +226,59 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 	}
 }
 
-// closedRun is true when the latest run holds no document for sure: a
-// plugin run that completed (it ends only with no document, or when it
-// refused its input), or a closed relay run from before the handoff. A
-// plugin run that failed or was stopped can still have its documents in a
-// state object, so it does not count: a read then answers unavailable.
-func (s *Store) closedRun(ctx context.Context, t route.Target) (bool, error) {
+// The states of the latest run of a workflow, for a reader.
+const (
+	// runLive: the run runs.
+	runLive = iota
+	// runEmpty: no run, or a run that holds no document for sure: a plugin
+	// run that completed (it ends only with no document, or when it refused
+	// its input), or a closed relay run from before the handoff.
+	runEmpty
+	// runStopped: a plugin run that failed or was stopped. It can still
+	// have documents (in its memory or in a state object), so a reader
+	// answers unavailable, never "no document".
+	runStopped
+)
+
+func (s *Store) runState(ctx context.Context, t route.Target) (int, error) {
 	d, err := s.clientFor(t).DescribeWorkflowExecution(ctx, t.WorkflowID, "")
 	if err != nil {
-		return false, err
+		if isNotFound(err) {
+			return runEmpty, nil
+		}
+		return runLive, err
 	}
 	info := d.GetWorkflowExecutionInfo()
 	status := info.GetStatus()
 	if status == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {
-		return false, nil
+		return runLive, nil
 	}
 	ty := info.GetType().GetName()
 	if ty != workflows.EntityWorkflow && ty != workflows.CatalogWorkflow {
-		return true, nil
+		return runEmpty, nil
 	}
-	return status == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, nil
+	if status == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED {
+		return runEmpty, nil
+	}
+	return runStopped, nil
+}
+
+// noDocument is called when an update found no running run. It gives nil
+// when the workflow holds no document for sure, else an unavailable error.
+func (s *Store) noDocument(ctx context.Context, t route.Target) error {
+	c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if ctx.Err() == nil {
+		c = ctx
+	}
+	state, err := s.runState(c, t)
+	if err != nil {
+		return unavailable(err)
+	}
+	if state == runStopped {
+		return protocol.NewError(protocol.Unavailable, "The workflow %s failed or was stopped. Look at the workflow in Temporal.", t.WorkflowID)
+	}
+	return nil
 }
 
 // running is true when the workflow has a running run.
