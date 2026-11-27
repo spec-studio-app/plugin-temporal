@@ -68,6 +68,7 @@ var (
 	_ plugin.Watcher         = (*Store)(nil)
 	_ plugin.StreamContinuer = (*Store)(nil)
 	_ plugin.Durable         = (*Store)(nil)
+	_ plugin.Committer       = (*Store)(nil)
 )
 
 // Durable is true: Temporal and the blob store keep the data.
@@ -161,7 +162,7 @@ func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
 		w := worker.New(wk.c, wk.tq, worker.Options{})
 		w.RegisterWorkflowWithOptions(workflows.Entity, workflow.RegisterOptions{Name: workflows.EntityWorkflow})
 		w.RegisterWorkflowWithOptions(workflows.Catalog, workflow.RegisterOptions{Name: workflows.CatalogWorkflow})
-		a := &activities.Activities{Client: wk.c, DC: wk.dc, Blobs: s.blobs, Router: s.router, CatalogRunLimit: s.opts.CatalogRunLimit, InlineBytes: s.opts.InlineBytes}
+		a := &activities.Activities{Client: wk.c, DC: wk.dc, Blobs: s.blobs, Router: s.router, CatalogRunLimit: s.opts.CatalogRunLimit, InlineBytes: s.opts.InlineBytes, RunLimit: s.opts.RunLimit, IdleMs: s.opts.Idle.Milliseconds()}
 		a.Register(w)
 		if err := w.Start(); err != nil {
 			s.stopWorkers()

@@ -10,7 +10,7 @@ permissions:
 
 env:
   # The plugin-sdk commit of the conformance runner (the same as go.mod).
-  PLUGIN_SDK_COMMIT: 394b06fac3b99e4255f69453ffe51eadf7b94d19
+  PLUGIN_SDK_COMMIT: ed507a40b3c59e3bc659950e9cc87f3800a096c7
   TEST_TEMPORAL_ADDRESS: 127.0.0.1:7233
   TEST_BUCKET_ENDPOINT: http://127.0.0.1:9000
   TEST_BUCKET_NAME: plugin-temporal-ci

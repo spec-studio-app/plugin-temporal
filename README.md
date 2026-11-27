@@ -14,13 +14,14 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 4. [Run with Temporal Cloud](#run-with-temporal-cloud)
 5. [Run with a self-hosted Temporal](#run-with-a-self-hosted-temporal)
 6. [How history and replay work](#how-history-and-replay-work)
+   - [state.commit](#statecommit)
 7. [The retention rule and the export](#the-retention-rule-and-the-export)
 8. [Move a relay from its built-in Temporal store](#move-a-relay-from-its-built-in-temporal-store)
 9. [Development](#development)
 
 ## What the plugin does
 
-- It gives the capabilities `state`, `events`, `watch` and `blobs` of the protocol version 1.0, and the test hook `continueStream`.
+- It speaks the protocol versions 1.0 and 1.1. It gives the capabilities `state`, `events`, `watch` and `blobs`, the call `state.commit` of 1.1 (see [state.commit](#statecommit)), and the test hook `continueStream`.
 - It keeps one workflow for each spec, one for each desk and one for the relay config. It uses the relay's workflow IDs and task queues:
 
   | Data | Workflow ID | Task queue |
@@ -34,7 +35,7 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 
   A repo key gets the relay's IDs only when it has the relay's form: 12 lowercase hex digits. Any other key gets the generic ID of the last two rows.
 
-- Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes.
+- Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes. `state.commit` is one update too: it writes a document and appends its events.
 - Each collection has a list workflow, `catalog/<deploy_id>/<collection>`. A list shows each write that returned. The list workflow of the `relay` collection is on `<task_queue>-config`.
 - The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The workflows of the `relay` collection (the relay config, other `relay` documents and their list workflow) use the config key. All other workflows use the data key.
 - The plugin never writes a key, a secret setting or a payload to its log, to an error or to a result.
@@ -139,6 +140,22 @@ The workflow history is the event log.
 
 The relay and the app write to the same spec workflow. So the relay's messages and the app's activity lines are in one ordered history. The app's scrubber reads the events of a time range, and reads a snapshot of a document from `blobs` by the SHA-256 that an event holds.
 
+### state.commit
+
+`state.commit` (protocol 1.1) writes a document and appends its events to a stream in one atomic step. The plugin sends one `commit` update to the workflow of the document.
+
+- The update's validator checks the expected version. A stale version gets `conflict` with the stored version. The validator refuses the update, so the history has no event of it: no document and no event changes.
+- A spec's document and its stream have the same workflow: `app-specs`, `specs` or `closed-specs` / `<repoKey>:<slug>` and the stream `spec:<repoKey>:<slug>` are all in `spec-<deploy_id>-<repoKey>-<slug>`. The update handler writes the document and gives the events their sequence numbers in the same workflow task. The update's input (the document and the events) and its result (the version and the sequence numbers) are in the history together. So the history holds both, or neither. An `events.read` takes the events of the completed `commit` updates and of the `append` updates, in order.
+- A document and a stream with two workflows (any other names, for example a document `notes/a` and a stream `notes-log`): the update writes the document, then sends the events to the stream's workflow with the `Deliver` activity, and completes after the stream took them. The commit returns only after that. The document's history holds the document and the events, and Temporal runs the activity again until the stream takes the events, so no event is lost. For a short time during the commit, a reader can see the new document before the events. The stream keeps the last 64 delivery IDs (`<document workflow>/<version>`) in its chain, so a delivery that comes again adds no event. The deliveries of one document go in the order of its versions.
+- A document of the `relay` collection uses the config key. A commit of such a document with events in a stream of the data key gets `refused`.
+- `events` can be empty. Then the update writes only the document, and the result has no cursor.
+
+Limits of one commit:
+
+- The whole request is at most `maxMessageBytes` (1.5 MiB), as for `events.append`, so the update's input stays under Temporal's payload limit (2 MB). The plugin-sdk refuses a larger request. No other limit applies to the number of events: split a large batch into more commits.
+- A commit is one update of the run. It counts toward the run limit (2000) and the continue-as-new rules, as an `append` does. A run that closes refuses the update, and the plugin sends it again to the next run.
+- The document counts toward the 512 KiB of documents in a continue-as-new input, as for `state.put`.
+
 ## The retention rule and the export
 
 A workflow cannot grow for ever. A run continues as new when Temporal suggests it, or after 2000 updates. A run with no document ends after 7 days with no update. Temporal deletes a closed run after the namespace's retention period (30 days by default on a self-hosted server; set on each namespace in Temporal Cloud).
@@ -166,7 +183,7 @@ A relay that used its built-in Temporal store moves to this plugin with the same
 
 - Go 1.26 or later.
 - `go test ./...`: the unit tests, the workflow tests (the Temporal Go SDK test suite), and the replay tests.
-- The replay tests replay each history in `internal/workflows/testdata/histories`. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh <name>`, for example `v2`. The script writes `<name>-*.json` and never replaces the files of an earlier shape: they must still replay.
+- The replay tests replay each history in `internal/workflows/testdata/histories`. The `v2-*` histories have `commit` updates and a `Deliver` activity. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh <name>`, for example `v2`. The script writes `<name>-*.json` and never replaces the files of an earlier shape: they must still replay.
 - The integration tests need a Temporal dev server, and for the bucket test an S3-compatible server:
 
   ```sh

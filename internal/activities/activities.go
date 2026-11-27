@@ -41,8 +41,13 @@ type Activities struct {
 	Router route.Router
 	// CatalogRunLimit is the run limit of new catalogs (0: the default).
 	CatalogRunLimit int
-	// InlineBytes is the inline state limit of new catalogs (tests only).
+	// InlineBytes is the inline state limit of new catalogs and entity
+	// workflows (tests only).
 	InlineBytes int
+	// RunLimit and IdleMs go into the start input of an entity workflow
+	// that the Deliver activity starts (0: the default).
+	RunLimit int
+	IdleMs   int64
 }
 
 // Register adds the activities to a worker.
@@ -54,6 +59,55 @@ func (a *Activities) Register(w worker.Worker) {
 	w.RegisterActivityWithOptions(a.SaveCatalog, activity.RegisterOptions{Name: workflows.ActivitySaveCatalog})
 	w.RegisterActivityWithOptions(a.LoadCatalog, activity.RegisterOptions{Name: workflows.ActivityLoadCatalog})
 	w.RegisterActivityWithOptions(a.DeleteObject, activity.RegisterOptions{Name: workflows.ActivityDeleteObject})
+	w.RegisterActivityWithOptions(a.Deliver, activity.RegisterOptions{Name: workflows.ActivityDeliver})
+}
+
+// Deliver appends the events of a commit to the workflow of their stream.
+// It starts that workflow with its chain when no run runs. The update ID is
+// the delivery ID, and the stream keeps the last delivery IDs in its chain,
+// so a second try adds no event: it gets the sequence numbers of the first.
+// A run that starts or closes refuses the update; the error makes the
+// activity try again.
+func (a *Activities) Deliver(ctx context.Context, in workflows.DeliverInput) (workflows.AppendResult, error) {
+	arg := workflows.AppendInput{
+		Bound:  workflows.Bound{Target: in.WorkflowID, AtMs: time.Now().UnixMilli()},
+		Stream: in.Stream, Events: in.Events, Delivery: in.ID,
+	}
+	upd := client.UpdateWorkflowOptions{
+		WorkflowID:   in.WorkflowID,
+		UpdateID:     in.ID,
+		UpdateName:   workflows.UpdateAppend,
+		Args:         []any{arg},
+		WaitForStage: client.WorkflowUpdateStageCompleted,
+	}
+	var res workflows.AppendResult
+	h, err := a.Client.UpdateWorkflow(ctx, upd)
+	var nf *serviceerror.NotFound
+	if errors.As(err, &nf) {
+		chain, cerr := ReadChain(ctx, a.Blobs, in.WorkflowID)
+		if cerr != nil {
+			return res, cerr
+		}
+		op := a.Client.NewWithStartWorkflowOperation(client.StartWorkflowOptions{
+			ID:                       in.WorkflowID,
+			TaskQueue:                in.TaskQueue,
+			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		}, workflows.EntityWorkflow, workflows.EntityInput{Chain: chain, RunLimit: a.RunLimit, IdleMs: a.IdleMs, InlineBytes: a.InlineBytes})
+		h, err = a.Client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{StartWorkflowOperation: op, UpdateOptions: upd})
+	}
+	if err == nil {
+		err = h.Get(ctx, &res)
+	}
+	var app *temporal.ApplicationError
+	if errors.As(err, &app) && app.Type() == workflows.ErrDelivered {
+		res = workflows.AppendResult{}
+		if derr := app.Details(&res); derr != nil {
+			return res, derr
+		}
+		return res, nil
+	}
+	return res, err
 }
 
 // CatalogPut puts an entry in the catalog of its collection. It starts the

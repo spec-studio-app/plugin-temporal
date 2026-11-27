@@ -39,6 +39,10 @@ type entity struct {
 	closing bool
 	// force is set by the continue update (the test hook).
 	force bool
+	// nextTurn and turn put the deliveries of the commits in the order of
+	// their versions: a commit takes the ticket nextTurn and delivers when
+	// turn is its ticket.
+	nextTurn, turn int
 }
 
 func docKey(collection, key string) string { return collection + "\x00" + key }
@@ -145,6 +149,60 @@ func (e *entity) write(ctx workflow.Context, collection, key string, value json.
 	entry := CatalogEntry{Attributes: attrs, Version: d.Version, N: d.N, UpdatedAt: d.UpdatedAt}
 	err := workflow.ExecuteActivity(catalogCtx(ctx), ActivityCatalogPut, CatalogPutInput{Collection: collection, Key: key, Entry: entry}).Get(ctx, nil)
 	return d, err
+}
+
+// appendEvents gives the next sequence numbers to the events of the stream.
+// It does not wait, so the caller's other changes go into the same
+// workflow task.
+func (e *entity) appendEvents(ctx workflow.Context, stream string, events []NewEvent) (seqs []int64, ats []time.Time) {
+	now := workflow.Now(ctx).UTC()
+	for _, ev := range events {
+		at := now
+		if ev.At != nil {
+			at = ev.At.UTC()
+		}
+		seqs = append(seqs, e.chain.NextSeq)
+		ats = append(ats, at)
+		e.chain.NextSeq++
+		if e.minAt == nil || at.Before(*e.minAt) {
+			t := at
+			e.minAt = &t
+		}
+		if e.maxAt == nil || at.After(*e.maxAt) {
+			t := at
+			e.maxAt = &t
+		}
+	}
+	e.chain.Stream = stream
+	return seqs, ats
+}
+
+// delivered finds a delivery that the chain has already.
+func (e *entity) delivered(id string) *Delivery {
+	if id == "" {
+		return nil
+	}
+	for i := range e.chain.Deliveries {
+		if e.chain.Deliveries[i].ID == id {
+			d := e.chain.Deliveries[i]
+			return &d
+		}
+	}
+	return nil
+}
+
+func (e *entity) checkStream(stream string) error {
+	if e.chain.Stream != "" && e.chain.Stream != stream {
+		return temporal.NewNonRetryableApplicationError("The stream is not the stream of this workflow.", ErrBadInput, nil)
+	}
+	return nil
+}
+
+func deliverCtx(ctx workflow.Context) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		RetryPolicy:         &temporal.RetryPolicy{InitialInterval: 200 * time.Millisecond, BackoffCoefficient: 2, MaximumInterval: 30 * time.Second},
+	})
 }
 
 // Entity is the entity workflow.
@@ -377,28 +435,18 @@ func (e *entity) handlers(ctx workflow.Context) error {
 	// the history: they are the event log.
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateAppend,
 		func(ctx workflow.Context, in AppendInput) (AppendResult, error) {
+			if d := e.delivered(in.Delivery); d != nil {
+				return AppendResult{}, e.deliveredErr(*d)
+			}
 			e.touch()
-			now := workflow.Now(ctx).UTC()
 			res := AppendResult{Nonce: e.chain.Nonce}
-			for _, ev := range in.Events {
-				at := now
-				if ev.At != nil {
-					at = ev.At.UTC()
-				}
-				seq := e.chain.NextSeq
-				e.chain.NextSeq++
-				res.Seqs = append(res.Seqs, seq)
-				res.Ats = append(res.Ats, at)
-				if e.minAt == nil || at.Before(*e.minAt) {
-					t := at
-					e.minAt = &t
-				}
-				if e.maxAt == nil || at.After(*e.maxAt) {
-					t := at
-					e.maxAt = &t
+			res.Seqs, res.Ats = e.appendEvents(ctx, in.Stream, in.Events)
+			if in.Delivery != "" {
+				e.chain.Deliveries = append(e.chain.Deliveries, Delivery{ID: in.Delivery, FirstSeq: res.Seqs[0], Count: len(res.Seqs)})
+				if n := len(e.chain.Deliveries); n > MaxDeliveries {
+					e.chain.Deliveries = append([]Delivery(nil), e.chain.Deliveries[n-MaxDeliveries:]...)
 				}
 			}
-			e.chain.Stream = in.Stream
 			return res, nil
 		},
 		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, in AppendInput) error {
@@ -408,10 +456,76 @@ func (e *entity) handlers(ctx workflow.Context) error {
 			if len(in.Events) == 0 {
 				return temporal.NewNonRetryableApplicationError("The event list is empty.", ErrBadInput, nil)
 			}
-			if e.chain.Stream != "" && e.chain.Stream != in.Stream {
-				return temporal.NewNonRetryableApplicationError("The stream is not the stream of this workflow.", ErrBadInput, nil)
+			if err := e.checkStream(in.Stream); err != nil {
+				return err
+			}
+			if d := e.delivered(in.Delivery); d != nil {
+				return e.deliveredErr(*d)
 			}
 			return nil
+		}},
+	); err != nil {
+		return err
+	}
+
+	// commit: state.commit. The update checks the version, writes the
+	// document and appends the events. When the stream is in this
+	// workflow (a spec: its document and its stream have one workflow),
+	// the document and the events change in the same workflow task, and the
+	// update's input and result in the history hold both, or the history
+	// holds neither. Else the events go to the stream's workflow with the
+	// Deliver activity, in the order of the versions, before the update
+	// completes; the activity tries again until the stream takes them.
+	commitCheck := func(in CommitInput) error {
+		if !sameVersion(e.storedVersion(in.Collection, in.Key), in.Expected) {
+			return conflictErr(e.storedVersion(in.Collection, in.Key))
+		}
+		return nil
+	}
+	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateCommit,
+		func(ctx workflow.Context, in CommitInput) (CommitResult, error) {
+			if err := commitCheck(in); err != nil {
+				return CommitResult{}, err
+			}
+			local := in.StreamTarget == e.wfID
+			if local && len(in.Events) > 0 {
+				if err := e.checkStream(in.Stream); err != nil {
+					return CommitResult{}, err
+				}
+			}
+			e.touch()
+			var res CommitResult
+			ticket := -1
+			if len(in.Events) > 0 {
+				if local {
+					res.Nonce = e.chain.Nonce
+					res.Seqs, res.Ats = e.appendEvents(ctx, in.Stream, in.Events)
+				} else {
+					ticket = e.nextTurn
+					e.nextTurn++
+				}
+			}
+			// write sets the document before it waits for the catalog.
+			d, err := e.write(ctx, in.Collection, in.Key, in.Value, in.Attributes)
+			if err == nil && ticket >= 0 {
+				err = e.deliver(ctx, ticket, in, d.Version, &res)
+			}
+			if err != nil {
+				return CommitResult{}, err
+			}
+			res.Version, res.UpdatedAt = d.Version, d.UpdatedAt
+			return res, nil
+		},
+		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, in CommitInput) error {
+			if err := e.open(ctx, in.Bound); err != nil {
+				return err
+			}
+			if in.StreamTarget == e.wfID && len(in.Events) > 0 {
+				if err := e.checkStream(in.Stream); err != nil {
+					return err
+				}
+			}
+			return commitCheck(in)
 		}},
 	); err != nil {
 		return err
@@ -489,6 +603,35 @@ func (e *entity) handlers(ctx workflow.Context) error {
 			return e.open(ctx, in.Bound)
 		}},
 	)
+}
+
+// deliver waits for the commit's turn, then sends its events to the
+// stream's workflow.
+func (e *entity) deliver(ctx workflow.Context, ticket int, in CommitInput, version string, res *CommitResult) error {
+	defer func() { e.turn++ }()
+	if err := workflow.Await(ctx, func() bool { return e.turn == ticket }); err != nil {
+		return err
+	}
+	var ar AppendResult
+	err := workflow.ExecuteActivity(deliverCtx(ctx), ActivityDeliver, DeliverInput{
+		WorkflowID: in.StreamTarget, TaskQueue: in.StreamQueue, Stream: in.Stream, Events: in.Events,
+		ID: e.wfID + "/" + version,
+	}).Get(ctx, &ar)
+	if err != nil {
+		return err
+	}
+	res.Remote, res.Nonce, res.Seqs = true, ar.Nonce, ar.Seqs
+	return nil
+}
+
+// deliveredErr refuses a delivery that the stream has already. Its detail
+// is the AppendResult of the first delivery (with no times).
+func (e *entity) deliveredErr(d Delivery) error {
+	res := AppendResult{Nonce: e.chain.Nonce}
+	for i := 0; i < d.Count; i++ {
+		res.Seqs = append(res.Seqs, d.FirstSeq+int64(i))
+	}
+	return temporal.NewNonRetryableApplicationError("The stream has the events of this delivery already.", ErrDelivered, nil, res)
 }
 
 // loop waits until the run must continue as new (end false) or end (end true).

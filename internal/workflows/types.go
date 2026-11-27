@@ -21,9 +21,10 @@ const (
 )
 
 // The update names of the entity workflow. The history reader finds the
-// events by UpdateAppend.
+// events by UpdateAppend and UpdateCommit.
 const (
 	UpdatePut          = "put"
+	UpdateCommit       = "commit"
 	UpdateDelete       = "delete"
 	UpdateAppend       = "append"
 	UpdateDeleteStream = "deleteStream"
@@ -62,6 +63,9 @@ const (
 	ActivitySaveCatalog   = "SaveCatalog"
 	ActivityLoadCatalog   = "LoadCatalog"
 	ActivityDeleteObject  = "DeleteObject"
+	// ActivityDeliver appends the events of a commit to the workflow of
+	// their stream, when that is not the workflow of the document.
+	ActivityDeliver = "Deliver"
 )
 
 // The types of the application errors that a validator or a handler gives.
@@ -82,6 +86,10 @@ const (
 	ErrBound = "bound"
 	// ErrBadInput: the input cannot be applied.
 	ErrBadInput = "bad_input"
+	// ErrDelivered: the stream has the events of this delivery already. The
+	// detail is the AppendResult of the first delivery, so the sender gets
+	// the same cursors.
+	ErrDelivered = "delivered"
 )
 
 // BoundMaxAge is the oldest input that a validator takes, as in the relay's
@@ -157,7 +165,22 @@ type Chain struct {
 	Stream string `json:"stream,omitempty"`
 	// Runs are the ended runs, oldest first.
 	Runs []RunRecord `json:"runs"`
+	// Deliveries are the last deliveries from commits that the stream took,
+	// newest last (at most MaxDeliveries). They go to the next run, so a
+	// delivery that comes again after a continue-as-new adds no event.
+	Deliveries []Delivery `json:"deliveries,omitempty"`
 }
+
+// Delivery records the events that one commit of another workflow appended
+// to this stream. The sequence numbers are FirstSeq to FirstSeq+Count-1.
+type Delivery struct {
+	ID       string `json:"id"`
+	FirstSeq int64  `json:"firstSeq"`
+	Count    int    `json:"count"`
+}
+
+// MaxDeliveries is the most Delivery records that a chain keeps.
+const MaxDeliveries = 64
 
 // HandoffInput is the input with which a relay workflow continues as new into
 // EntityWorkflow. The relay makes the documents with its protocol adapter.
@@ -231,6 +254,9 @@ type AppendInput struct {
 	Bound  Bound      `json:"bound"`
 	Stream string     `json:"stream"`
 	Events []NewEvent `json:"events"`
+	// Delivery is set when the Deliver activity sends the events of a
+	// commit. A delivery that the chain has already adds no event.
+	Delivery string `json:"delivery,omitempty"`
 }
 
 // AppendResult gives each event its sequence number and its time.
@@ -238,6 +264,49 @@ type AppendResult struct {
 	Nonce string      `json:"nonce"`
 	Seqs  []int64     `json:"seqs"`
 	Ats   []time.Time `json:"ats"`
+}
+
+// CommitInput is the input of the commit update (state.commit). It is the
+// input of a put and the input of an append in one update.
+type CommitInput struct {
+	Bound      Bound           `json:"bound"`
+	Collection string          `json:"collection"`
+	Key        string          `json:"key"`
+	Value      json.RawMessage `json:"value"`
+	Attributes map[string]any  `json:"attributes"`
+	// Expected is nil for "the document must not exist".
+	Expected *string    `json:"expected"`
+	Stream   string     `json:"stream"`
+	Events   []NewEvent `json:"events"`
+	// StreamTarget and StreamQueue are the workflow ID and the task queue
+	// of the stream. When StreamTarget is this workflow, the events go into
+	// this history with the document. Else the update sends them to that
+	// workflow with the Deliver activity before it completes.
+	StreamTarget string `json:"streamTarget"`
+	StreamQueue  string `json:"streamQueue"`
+}
+
+// CommitResult is the result of the commit update. Nonce, Seqs and Ats are
+// the events' sequence numbers and times: in this history when Remote is
+// false, in the stream's workflow when Remote is true (then Ats is empty).
+type CommitResult struct {
+	Version   string      `json:"version"`
+	UpdatedAt time.Time   `json:"updatedAt"`
+	Remote    bool        `json:"remote,omitempty"`
+	Nonce     string      `json:"nonce,omitempty"`
+	Seqs      []int64     `json:"seqs,omitempty"`
+	Ats       []time.Time `json:"ats,omitempty"`
+}
+
+// DeliverInput is the input of the Deliver activity.
+type DeliverInput struct {
+	WorkflowID string     `json:"workflowId"`
+	TaskQueue  string     `json:"taskQueue"`
+	Stream     string     `json:"stream"`
+	Events     []NewEvent `json:"events"`
+	// ID names the delivery: the document's workflow ID and the new
+	// version. It is the update ID of the append too.
+	ID string `json:"id"`
 }
 
 // DeleteStreamInput is the input of the deleteStream update.
