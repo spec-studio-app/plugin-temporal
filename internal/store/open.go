@@ -42,6 +42,7 @@ type Options struct {
 
 // Store is the plugin's storage.
 type Store struct {
+	optsFn   func() Options
 	opts     Options
 	set      *settings.Settings
 	router   route.Router
@@ -54,8 +55,9 @@ type Store struct {
 	log      *slog.Logger
 }
 
-// New makes a store. Open connects it.
-func New(o Options) *Store { return &Store{opts: o} }
+// New makes a store. Open connects it, and reads the options then (after the
+// flags are parsed).
+func New(opts func() Options) *Store { return &Store{optsFn: opts} }
 
 var (
 	_ plugin.Store           = (*Store)(nil)
@@ -85,6 +87,9 @@ func (h warnHandler) Enabled(ctx context.Context, l slog.Level) bool {
 
 // Open connects to Temporal and the blob store, and starts the workers.
 func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
+	if s.optsFn != nil {
+		s.opts = s.optsFn()
+	}
 	set, err := settings.Parse(o.Settings)
 	if err != nil {
 		return err
