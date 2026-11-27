@@ -159,6 +159,16 @@ Limits of one commit:
 - A commit is one update of the run. It counts toward the run limit (2000) and the continue-as-new rules, as an `append` does. A run that closes refuses the update, and the plugin sends it again to the next run.
 - The document counts toward the 512 KiB of documents in a continue-as-new input, as for `state.put`.
 
+### Update every plugin-temporal of a deploy together
+
+The app's plugin and the relay's plugin are Temporal workers on the same task queue, `relay-<deploy_id>`. Each one can run a workflow task of any spec workflow. So they must run the same version of plugin-temporal. An older plugin-temporal (one with no `commit` update) on the same task queue:
+
+- does not know the `commit` update. When it gets one, it rejects it: the commit writes nothing, and the caller gets `unavailable` with a text that says to update every plugin-temporal of the deploy.
+- cannot replay a history that has a `commit` update. Its workflow task fails, and Temporal gives the task again, maybe to the same worker. It has no `Deliver` activity, so that activity waits for a newer worker.
+- drops the delivery IDs of a stream's chain when it continues the run as new. Then a delivery that comes again can add its events a second time.
+
+The plugin cannot prevent this by itself. So update the relay's plugin-temporal and every app on the same deploy together, before the app uses protocol 1.1 (`state.commit`). Each change to the workflow code uses `workflow.GetVersion`, so a newer worker replays the histories of an older one.
+
 ## The retention rule and the export
 
 A workflow cannot grow for ever. A run continues as new when Temporal suggests it, or after 2000 updates. A run with no document ends after 7 days with no update. Temporal deletes a closed run after the namespace's retention period (30 days by default on a self-hosted server; set on each namespace in Temporal Cloud).

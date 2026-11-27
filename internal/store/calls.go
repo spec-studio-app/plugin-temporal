@@ -75,6 +75,13 @@ func classify(err error) error {
 	}
 	var app *temporal.ApplicationError
 	if errors.As(err, &app) {
+		// A worker of an older plugin-temporal took the workflow task and
+		// rejected an update that it does not know. A rejected update writes
+		// nothing.
+		if name, ok := strings.CutPrefix(app.Message(), "unknown update "); ok {
+			name, _, _ = strings.Cut(name, ".")
+			return protocol.NewError(protocol.Unavailable, "A Temporal worker of this deploy runs an older plugin-temporal that does not know the update %s, so it wrote nothing. Update every plugin-temporal of the deploy (the app's and the relay's) to the same version.", name)
+		}
 		switch app.Type() {
 		case workflows.ErrConflict:
 			var stored *string
