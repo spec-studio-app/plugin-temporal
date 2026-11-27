@@ -150,3 +150,18 @@ func TestWaitZeroTimeout(t *testing.T) {
 	}
 	time.Sleep(0)
 }
+
+// A plugin run that was stopped still has its documents: a read never says
+// "no document" for it.
+func TestTerminatedRunIsNotEmpty(t *testing.T) {
+	s := newEnv(t).open(Options{})
+	put(t, s, "notes", "term", 1, nil, nil)
+	tg := s.router.Doc("notes", "term")
+	if err := s.data.TerminateWorkflow(ctx(t), tg.WorkflowID, "", "test"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx(t), protocol.StateGetParams{Collection: "notes", Key: "term"})
+	if (err == nil && !got.Exists) || (err != nil && !protocol.Is(err, protocol.Unavailable)) {
+		t.Fatalf("get after a stop: %+v %v", got, err)
+	}
+}

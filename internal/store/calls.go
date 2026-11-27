@@ -221,15 +221,26 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 	}
 }
 
-// closedRun is true when the latest run is closed. A plugin run closes only
-// when it holds no document (an idle end, or a refused input); a closed run
-// of another type is a relay run from before the handoff.
+// closedRun is true when the latest run holds no document for sure: a
+// plugin run that completed (it ends only with no document, or when it
+// refused its input), or a closed relay run from before the handoff. A
+// plugin run that failed or was stopped can still have its documents in a
+// state object, so it does not count: a read then answers unavailable.
 func (s *Store) closedRun(ctx context.Context, t route.Target) (bool, error) {
 	d, err := s.clientFor(t).DescribeWorkflowExecution(ctx, t.WorkflowID, "")
 	if err != nil {
 		return false, err
 	}
-	return d.GetWorkflowExecutionInfo().GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
+	info := d.GetWorkflowExecutionInfo()
+	status := info.GetStatus()
+	if status == enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING {
+		return false, nil
+	}
+	ty := info.GetType().GetName()
+	if ty != workflows.EntityWorkflow && ty != workflows.CatalogWorkflow {
+		return true, nil
+	}
+	return status == enumspb.WORKFLOW_EXECUTION_STATUS_COMPLETED, nil
 }
 
 // running is true when the workflow has a running run.

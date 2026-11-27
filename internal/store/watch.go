@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
@@ -39,11 +40,16 @@ func checkCtx() (context.Context, context.CancelFunc) {
 // docNow checks a document wait once, with its own short context: the
 // protocol says that a wait whose condition is true already ends with
 // changed true, also when the host's time is up.
-func (s *Store) docNow(p protocol.WatchWaitParams) (protocol.WatchWaitResult, error) {
+func (s *Store) docNow(p protocol.WatchWaitParams, atTimeout bool) (protocol.WatchWaitResult, error) {
 	c, cancel := checkCtx()
 	defer cancel()
 	d, err := s.getDoc(c, p.Collection, p.Key)
 	if err != nil {
+		if atTimeout {
+			// The host's time is up and the check did not answer: the
+			// wait ends as a timeout, as the protocol says.
+			return protocol.WatchWaitResult{Changed: false}, nil
+		}
 		return protocol.WatchWaitResult{}, err
 	}
 	var v *string
@@ -57,11 +63,14 @@ func (s *Store) docNow(p protocol.WatchWaitParams) (protocol.WatchWaitResult, er
 }
 
 // streamNow checks a stream wait once, with its own short context.
-func (s *Store) streamNow(t route.Target, stream string, after int64) (protocol.WatchWaitResult, error) {
+func (s *Store) streamNow(t route.Target, stream string, after int64, atTimeout bool) (protocol.WatchWaitResult, error) {
 	c, cancel := checkCtx()
 	defer cancel()
 	st, err := s.streamState(c, t)
 	if err != nil {
+		if atTimeout {
+			return protocol.WatchWaitResult{Changed: false}, nil
+		}
 		return protocol.WatchWaitResult{}, err
 	}
 	if st == nil || (st.chain.Stream != "" && st.chain.Stream != stream) {
@@ -75,11 +84,25 @@ func (s *Store) streamNow(t route.Target, stream string, after int64) (protocol.
 	return protocol.WatchWaitResult{Changed: false}, nil
 }
 
+// waitTimedOut is true when a wait update ended because time ran out: the
+// host's deadline, or Temporal's own limit of a long update call. The loop
+// then checks again (once, at the host's deadline), and never gives an error.
+func waitTimedOut(ctx context.Context, err error) bool {
+	if ctx.Err() != nil || remaining(ctx) <= time.Second {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Timeout or cancellation waiting for update") || strings.Contains(msg, "did not answer in time") || strings.Contains(msg, "deadline exceeded")
+}
+
 func (s *Store) waitDoc(ctx context.Context, p protocol.WatchWaitParams) (protocol.WatchWaitResult, error) {
 	t := s.router.Doc(p.Collection, p.Key)
 	for {
 		if remaining(ctx) <= 50*time.Millisecond || ctx.Err() != nil {
-			return s.docNow(p)
+			return s.docNow(p, true)
 		}
 		var res workflows.WaitResult
 		arg := func() any {
@@ -92,10 +115,10 @@ func (s *Store) waitDoc(ctx context.Context, p protocol.WatchWaitParams) (protoc
 			// No run: the document does not exist, and the host has a version.
 			return protocol.WatchWaitResult{Changed: true, Version: nil}, nil
 		case errors.Is(err, errReady):
-			return s.docNow(p)
+			return s.docNow(p, false)
 		case err != nil:
-			if ctx.Err() != nil {
-				return s.docNow(p)
+			if waitTimedOut(ctx, err) {
+				continue
 			}
 			return protocol.WatchWaitResult{}, err
 		case res.Changed:
@@ -122,7 +145,7 @@ func (s *Store) waitStream(ctx context.Context, p protocol.WatchWaitParams) (pro
 	}
 	for {
 		if remaining(ctx) <= 50*time.Millisecond || ctx.Err() != nil {
-			return s.streamNow(t, p.Stream, after)
+			return s.streamNow(t, p.Stream, after, true)
 		}
 		var res workflows.WaitResult
 		arg := func() any {
@@ -131,10 +154,10 @@ func (s *Store) waitStream(ctx context.Context, p protocol.WatchWaitParams) (pro
 		err := s.update(ctx, t, workflows.UpdateWait, arg, &res, true)
 		switch {
 		case errors.Is(err, errReady):
-			return s.streamNow(t, p.Stream, after)
+			return s.streamNow(t, p.Stream, after, false)
 		case err != nil:
-			if ctx.Err() != nil {
-				return s.streamNow(t, p.Stream, after)
+			if waitTimedOut(ctx, err) {
+				continue
 			}
 			return protocol.WatchWaitResult{}, err
 		case res.Changed:
