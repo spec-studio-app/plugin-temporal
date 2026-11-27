@@ -53,15 +53,38 @@ func TestLargeStateSpill(t *testing.T) {
 			t.Fatalf("%s after the spill: %v", c, err)
 		}
 	}
-	files, _ := filepath.Glob(filepath.Join(e.blobDir, "state", "*", "*.bin"))
-	if len(files) == 0 {
-		t.Fatal("no state object")
-	}
-	for _, f := range files {
-		b, _ := os.ReadFile(f)
-		if bytes.Contains(b, []byte(marker)) {
-			t.Fatalf("the state object %s is not encrypted", f)
+	// The next run loaded the state object and removed it.
+	waitFor(t, "the state objects go", 30*time.Second, func() bool {
+		files, _ := filepath.Glob(filepath.Join(e.blobDir, "state", "*", "*.bin"))
+		return len(files) == 0
+	})
+	// No file of the blob folder holds a document value in plain text.
+	_ = filepath.Walk(e.blobDir, func(path string, fi os.FileInfo, err error) error {
+		if err == nil && !fi.IsDir() {
+			if b, _ := os.ReadFile(path); bytes.Contains(b, []byte(marker)) {
+				t.Errorf("%s holds a document value in plain text", path)
+			}
 		}
+		return nil
+	})
+}
+
+// A run that refused its start input holds no document: a read says so.
+func TestRefusedInputRun(t *testing.T) {
+	e := newEnv(t)
+	s := e.open(Options{})
+	tg := s.router.Doc("specs", "1a2b3c4d5e6f:refused")
+	run, err := s.data.ExecuteWorkflow(ctx(t), client.StartWorkflowOptions{ID: tg.WorkflowID, TaskQueue: tg.TaskQueue}, workflows.EntityWorkflow,
+		workflows.EntityInput{Chain: &workflows.Chain{WorkflowID: "spec-other-1a2b3c4d5e6f-x", Nonce: "abc", NextSeq: 1, KeptFrom: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Get(ctx(t), nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx(t), protocol.StateGetParams{Collection: "specs", Key: "1a2b3c4d5e6f:refused"})
+	if err != nil || got.Exists {
+		t.Fatalf("get: %+v %v", got, err)
 	}
 }
 
@@ -76,10 +99,12 @@ func TestCatalogSpill(t *testing.T) {
 	if err != nil || len(res.Items) != 4 {
 		t.Fatalf("list after the spill: %d items, %v", len(res.Items), err)
 	}
-	files, _ := filepath.Glob(filepath.Join(e.blobDir, "catalog", "*", "*.bin"))
-	if len(files) == 0 {
-		t.Fatal("no catalog object")
-	}
+	// The next run loaded the catalog object and removed it; at most the
+	// object of a run that closes now is there.
+	waitFor(t, "the catalog objects go", 30*time.Second, func() bool {
+		files, _ := filepath.Glob(filepath.Join(e.blobDir, "catalog", "*", "*.bin"))
+		return len(files) <= 1
+	})
 }
 
 // A spec whose relay workflow closed before the handoff has no document.

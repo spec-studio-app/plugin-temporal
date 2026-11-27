@@ -229,6 +229,10 @@ func Entity(ctx workflow.Context, in EntityInput) error {
 				e.docs[docKey(d.Collection, d.Key)] = &d
 			}
 		}
+		// The run has the documents: the object of the last run goes.
+		if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityDeleteObject, in.StateObject).Get(ctx, nil); err != nil {
+			return err
+		}
 	}
 	if in.Handoff != nil {
 		if err := e.handoff(ctx, in.Handoff, info.ContinuedExecutionRunID); err != nil {
@@ -490,7 +494,7 @@ func (e *entity) handlers(ctx workflow.Context) error {
 // loop waits until the run must continue as new (end false) or end (end true).
 func (e *entity) loop(ctx workflow.Context) (bool, error) {
 	mustContinue := func() bool {
-		return e.force || e.updates >= e.runLimit || workflow.GetInfo(ctx).GetContinueAsNewSuggested()
+		return e.force || e.updates >= e.runLimit || (e.updates >= MinUpdatesPerRun && workflow.GetInfo(ctx).GetContinueAsNewSuggested())
 	}
 	for {
 		seen := e.activity
@@ -541,7 +545,7 @@ func (e *entity) close(ctx workflow.Context, end bool) error {
 	if !end {
 		size := 0
 		for _, d := range docs {
-			size += len(d.Value) + 256
+			size += JSONSize(d)
 		}
 		limit := InlineStateBytes
 		if e.inlineBytes > 0 {

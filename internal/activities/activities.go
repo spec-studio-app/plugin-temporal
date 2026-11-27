@@ -53,6 +53,7 @@ func (a *Activities) Register(w worker.Worker) {
 	w.RegisterActivityWithOptions(a.LoadState, activity.RegisterOptions{Name: workflows.ActivityLoadState})
 	w.RegisterActivityWithOptions(a.SaveCatalog, activity.RegisterOptions{Name: workflows.ActivitySaveCatalog})
 	w.RegisterActivityWithOptions(a.LoadCatalog, activity.RegisterOptions{Name: workflows.ActivityLoadCatalog})
+	w.RegisterActivityWithOptions(a.DeleteObject, activity.RegisterOptions{Name: workflows.ActivityDeleteObject})
 }
 
 // CatalogPut puts an entry in the catalog of its collection. It starts the
@@ -63,7 +64,7 @@ func (a *Activities) CatalogPut(ctx context.Context, in workflows.CatalogPutInpu
 		ID:                       t.WorkflowID,
 		TaskQueue:                t.TaskQueue,
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-	}, workflows.CatalogWorkflow, workflows.CatalogInput{Collection: in.Collection, RunLimit: a.CatalogRunLimit, InlineBytes: a.InlineBytes})
+	}, workflows.CatalogWorkflow, workflows.CatalogInput{WorkflowID: t.WorkflowID, Collection: in.Collection, RunLimit: a.CatalogRunLimit, InlineBytes: a.InlineBytes})
 	in.Bound = workflows.Bound{Target: t.WorkflowID, AtMs: time.Now().UnixMilli()}
 	h, err := a.Client.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: start,
@@ -297,23 +298,37 @@ func (a *Activities) SaveCatalog(ctx context.Context, in workflows.SaveCatalogIn
 	return a.writeSealed(ctx, in.Name, items)
 }
 
-// LoadCatalog gives one page of a saved catalog, in key order after After.
-func (a *Activities) LoadCatalog(ctx context.Context, in workflows.LoadCatalogInput) ([]workflows.PageItem, error) {
+// LoadCatalog gives one page of a saved catalog, in key order after After,
+// of at most MaxBytes of JSON.
+func (a *Activities) LoadCatalog(ctx context.Context, in workflows.LoadCatalogInput) (workflows.LoadCatalogResult, error) {
 	ps, err := a.readSealed(ctx, in.Name)
 	if err != nil {
-		return nil, err
+		return workflows.LoadCatalogResult{}, err
 	}
-	out := []workflows.PageItem{}
+	out := workflows.LoadCatalogResult{Items: []workflows.PageItem{}}
+	size := 0
 	for _, p := range ps {
 		var it workflows.PageItem
 		if err := a.DC.FromPayload(p, &it); err != nil {
-			return nil, temporal.NewNonRetryableApplicationError("An entry of the catalog object does not decrypt.", "object_bad", nil)
+			return out, temporal.NewNonRetryableApplicationError("An entry of the catalog object does not decrypt.", "object_bad", nil)
 		}
-		if it.Key > in.After && len(out) < in.Limit {
-			out = append(out, it)
+		if it.Key <= in.After {
+			continue
 		}
+		n := workflows.JSONSize(it)
+		if len(out.Items) > 0 && size+n > in.MaxBytes {
+			out.More = true
+			break
+		}
+		out.Items = append(out.Items, it)
+		size += n
 	}
 	return out, nil
+}
+
+// DeleteObject removes a state or catalog object that a run loaded.
+func (a *Activities) DeleteObject(ctx context.Context, name string) error {
+	return a.Blobs.DeleteObject(ctx, name)
 }
 
 // DeleteExports removes exports and writes the manifest.

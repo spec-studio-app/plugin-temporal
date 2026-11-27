@@ -61,6 +61,7 @@ const (
 	ActivityLoadState     = "LoadState"
 	ActivitySaveCatalog   = "SaveCatalog"
 	ActivityLoadCatalog   = "LoadCatalog"
+	ActivityDeleteObject  = "DeleteObject"
 )
 
 // The types of the application errors that a validator or a handler gives.
@@ -292,6 +293,9 @@ type CatalogEntry struct {
 
 // CatalogInput is the start input of the catalog workflow.
 type CatalogInput struct {
+	// WorkflowID is the catalog's own workflow ID. A run refuses an input
+	// for another catalog (another collection or another deploy).
+	WorkflowID string                  `json:"workflowId"`
 	Collection string                  `json:"collection"`
 	Entries    map[string]CatalogEntry `json:"entries,omitempty"`
 	// EntriesObject names the entries in the blob store, when they were too
@@ -390,5 +394,32 @@ type SaveCatalogInput struct {
 type LoadCatalogInput struct {
 	Name  string `json:"name"`
 	After string `json:"after"`
-	Limit int    `json:"limit"`
+	// MaxBytes limits the JSON size of the page.
+	MaxBytes int `json:"maxBytes"`
+}
+
+// LoadCatalogResult is one page of a saved catalog.
+type LoadCatalogResult struct {
+	Items []PageItem `json:"items"`
+	More  bool       `json:"more"`
+}
+
+// MinUpdatesPerRun is the least number of updates that a run takes before
+// it follows Temporal's continue-as-new suggestion. A run that loads a
+// large state has a large history from its start, so the suggestion can be
+// true at once; without this floor such a run would continue as new again
+// and again and take no update.
+const MinUpdatesPerRun = 100
+
+// LoadPageBytes is the largest JSON size of one LoadCatalog page.
+const LoadPageBytes = 512 * 1024
+
+// JSONSize gives the JSON size of a value: the size of the value in a
+// payload. It is deterministic.
+func JSONSize(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }

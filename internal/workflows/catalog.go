@@ -43,16 +43,13 @@ func Matches(attrs, filter map[string]any) bool {
 	return true
 }
 
-// catalogPageSize is the most entries in one SaveCatalog query or one
-// LoadCatalog result (each entry is a few hundred bytes).
-const catalogPageSize = 1000
-
 // Catalog is the catalog workflow: the list index of one collection.
 func Catalog(ctx workflow.Context, in CatalogInput) error {
 	info := workflow.GetInfo(ctx)
 	wfID := info.WorkflowExecution.ID
-	// A start input copied from another collection's catalog: end at once.
-	if !strings.HasSuffix(wfID, "/"+in.Collection) {
+	// A start input copied from another catalog (another collection or
+	// another deploy): end at once.
+	if in.WorkflowID != wfID || !strings.HasSuffix(wfID, "/"+in.Collection) {
 		workflow.GetLogger(ctx).Warn("The start input is for another catalog. The run ends with no data.")
 		return nil
 	}
@@ -156,23 +153,27 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 	if in.EntriesObject != "" {
 		after := ""
 		for {
-			var page []PageItem
-			if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityLoadCatalog, LoadCatalogInput{Name: in.EntriesObject, After: after, Limit: catalogPageSize}).Get(ctx, &page); err != nil {
+			var page LoadCatalogResult
+			if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityLoadCatalog, LoadCatalogInput{Name: in.EntriesObject, After: after, MaxBytes: LoadPageBytes}).Get(ctx, &page); err != nil {
 				return err
 			}
-			for _, it := range page {
+			for _, it := range page.Items {
 				entries[it.Key] = it.Entry
 				after = it.Key
 			}
-			if len(page) < catalogPageSize {
+			if !page.More {
 				break
 			}
+		}
+		// The run has the entries: the object of the last run goes.
+		if err := workflow.ExecuteActivity(exportCtx(ctx), ActivityDeleteObject, in.EntriesObject).Get(ctx, nil); err != nil {
+			return err
 		}
 		ready = true
 	}
 
 	if err := workflow.Await(ctx, func() bool {
-		return updates >= runLimit || workflow.GetInfo(ctx).GetContinueAsNewSuggested()
+		return updates >= runLimit || (updates >= MinUpdatesPerRun && workflow.GetInfo(ctx).GetContinueAsNewSuggested())
 	}); err != nil {
 		return err
 	}
@@ -187,12 +188,9 @@ func Catalog(ctx workflow.Context, in CatalogInput) error {
 			delete(entries, k)
 			continue
 		}
-		size += len(k) + 256
-		for ak := range e.Attributes {
-			size += len(ak) + 32
-		}
+		size += len(k) + JSONSize(e) + 8
 	}
-	next := CatalogInput{Collection: in.Collection, RunLimit: in.RunLimit, InlineBytes: in.InlineBytes}
+	next := CatalogInput{WorkflowID: wfID, Collection: in.Collection, RunLimit: in.RunLimit, InlineBytes: in.InlineBytes}
 	limit := InlineStateBytes
 	if in.InlineBytes > 0 {
 		limit = in.InlineBytes

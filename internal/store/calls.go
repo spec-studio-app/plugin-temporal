@@ -203,10 +203,13 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 		if isNotFound(err) {
 			return errNotRunning
 		}
+		// A closed latest run holds no document: a relay run that ended
+		// before the handoff, a run that refused its input, or a run that
+		// ended with no data.
+		if closed, derr := s.closedRun(ctx, t); derr == nil && closed {
+			return errNotRunning
+		}
 		if !strings.Contains(err.Error(), workflows.QueryStarting) {
-			if foreign, derr := s.closedForeign(ctx, t); derr == nil && foreign {
-				return errNotRunning
-			}
 			return unavailable(err)
 		}
 		select {
@@ -218,16 +221,15 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 	}
 }
 
-// closedForeign is true when the latest run is closed and is not a run of
-// this plugin's workflow types.
-func (s *Store) closedForeign(ctx context.Context, t route.Target) (bool, error) {
+// closedRun is true when the latest run is closed. A plugin run closes only
+// when it holds no document (an idle end, or a refused input); a closed run
+// of another type is a relay run from before the handoff.
+func (s *Store) closedRun(ctx context.Context, t route.Target) (bool, error) {
 	d, err := s.clientFor(t).DescribeWorkflowExecution(ctx, t.WorkflowID, "")
 	if err != nil {
 		return false, err
 	}
-	info := d.GetWorkflowExecutionInfo()
-	ty := info.GetType().GetName()
-	return info.GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING && ty != workflows.EntityWorkflow && ty != workflows.CatalogWorkflow, nil
+	return d.GetWorkflowExecutionInfo().GetStatus() != enumspb.WORKFLOW_EXECUTION_STATUS_RUNNING, nil
 }
 
 // running is true when the workflow has a running run.

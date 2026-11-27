@@ -35,17 +35,24 @@ func TestCatalogRefusesCopies(t *testing.T) {
 	send(2*time.Second, CatalogPutInput{Bound: Bound{Target: "catalog/test/app-specs", AtMs: env.Now().UnixMilli()}, Collection: "specs", Key: "k"})
 	send(3*time.Second, CatalogPutInput{Bound: b(), Collection: "specs", Key: "k"})
 	env.RegisterDelayedCallback(func() { env.CancelWorkflow() }, 4*time.Second)
-	env.ExecuteWorkflow(CatalogWorkflow, CatalogInput{Collection: "specs"})
+	env.ExecuteWorkflow(CatalogWorkflow, CatalogInput{WorkflowID: "catalog/test/specs", Collection: "specs"})
 	if len(rejected) != 2 || rejected[0] != ErrBadInput || rejected[1] != ErrBound {
 		t.Fatalf("rejections %v", rejected)
 	}
 }
 
-// A start input of another collection ends the catalog run with no data.
+// A start input of another collection, or of another deploy's catalog of the
+// same collection, ends the catalog run with no data.
 func TestCatalogCopiedInput(t *testing.T) {
-	env := catalogEnv("catalog/test/specs")
-	env.ExecuteWorkflow(CatalogWorkflow, CatalogInput{Collection: "app-specs", Entries: map[string]CatalogEntry{"x": {}}})
-	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
-		t.Fatalf("the catalog took a copied input: %v", env.GetWorkflowError())
+	for _, in := range []CatalogInput{
+		{WorkflowID: "catalog/test/app-specs", Collection: "app-specs", Entries: map[string]CatalogEntry{"x": {}}},
+		{WorkflowID: "catalog/other/specs", Collection: "specs", Entries: map[string]CatalogEntry{"x": {}}},
+		{Collection: "specs", Entries: map[string]CatalogEntry{"x": {}}},
+	} {
+		env := catalogEnv("catalog/test/specs")
+		env.ExecuteWorkflow(CatalogWorkflow, in)
+		if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+			t.Fatalf("the catalog took a copied input %+v: %v", in, env.GetWorkflowError())
+		}
 	}
 }
