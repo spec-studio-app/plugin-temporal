@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
@@ -141,13 +143,16 @@ func TestCommitOtherStream(t *testing.T) {
 	}
 }
 
-// A document and a stream with two workflows: the commit writes the
-// document, then delivers the events to the stream's workflow in the order
-// of the versions, and completes with the stream's sequence numbers.
+// A document and a stream with two workflows: the commit delivers the
+// events to the stream's workflow, then writes the document, and completes
+// with the stream's sequence numbers.
 func TestCommitRemote(t *testing.T) {
 	h := newHarness(t)
 	var delivered []DeliverInput
+	var order []string
+	h.catalogErr = func(in CatalogPutInput) error { order = append(order, "catalog "+in.Entry.Version); return nil }
 	h.env.RegisterActivityWithOptions(func(ctx context.Context, in DeliverInput) (AppendResult, error) {
+		order = append(order, "deliver "+in.ID)
 		delivered = append(delivered, in)
 		base := int64(len(delivered) * 10)
 		res := AppendResult{Nonce: "abc"}
@@ -185,6 +190,150 @@ func TestCommitRemote(t *testing.T) {
 	if info.Chain.Stream != "" || info.Chain.NextSeq != 1 {
 		t.Fatalf("the document's chain: %+v", info.Chain)
 	}
+	want := []string{"deliver " + wfID + "/" + r1.Version, "catalog " + r1.Version, "deliver " + wfID + "/" + r2.Version, "catalog " + r2.Version}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("the order is %v; want %v", order, want)
+	}
+}
+
+// A remote commit whose delivery fails writes nothing: no document, no
+// catalog entry. While the delivery runs, the document is not visible, and a
+// put of the document waits for the commit's end. A later commit of the
+// document works.
+func TestCommitRemoteDeliveryFails(t *testing.T) {
+	h := newHarness(t)
+	h.env.RegisterActivityWithOptions(func(ctx context.Context, in DeliverInput) (AppendResult, error) { return AppendResult{}, nil },
+		activity.RegisterOptions{Name: ActivityDeliver})
+	h.env.OnActivity(ActivityDeliver, mock.Anything, mock.Anything).After(5*time.Second).Return(AppendResult{},
+		temporal.NewNonRetryableApplicationError("The update input is too old.", ErrBound, nil)).Once()
+	h.env.OnActivity(ActivityDeliver, mock.Anything, mock.Anything).Return(AppendResult{Nonce: "abc", Seqs: []int64{7}}, nil)
+	in := func(expected *string) CommitInput {
+		return CommitInput{Bound: h.bound(), Collection: "notes", Key: "a", Value: json.RawMessage(`1`), Expected: expected,
+			Stream: "notes-stream", Events: []NewEvent{{Type: "e"}}, StreamTarget: "stream/test/notes-stream", StreamQueue: "q"}
+	}
+	failed := h.commit(time.Second, func() CommitInput { return in(nil) })
+	var during *Doc
+	h.env.RegisterDelayedCallback(func() { during = h.doc("notes", "a") }, 3*time.Second)
+	put := h.update(4*time.Second, UpdatePut, nil, PutInput{Bound: Bound{Target: wfID, AtMs: h.env.Now().Add(4 * time.Second).UnixMilli()}, Collection: "notes", Key: "a", Value: json.RawMessage(`9`)})
+	var putDoneEarly bool
+	h.env.RegisterDelayedCallback(func() { putDoneEarly = put.done }, 5*time.Second)
+	var after *Doc
+	var puts int
+	h.env.RegisterDelayedCallback(func() { after = h.doc("notes", "a"); puts = h.catalogPuts }, 7*time.Second)
+	again := h.commit(8*time.Second, func() CommitInput {
+		v := after.Version
+		return in(&v)
+	})
+	cont := h.update(9*time.Second, UpdateContinue, nil, ContinueInput{Bound: h.bound()})
+	h.env.RegisterDelayedCallback(func() {}, 10*time.Second)
+	h.env.ExecuteWorkflow(EntityWorkflow, EntityInput{})
+
+	if appType(failed.err) != ErrBound {
+		t.Fatalf("the failed commit: %+v", failed)
+	}
+	if during != nil {
+		t.Fatalf("the document is visible during the delivery: %+v", during)
+	}
+	// The put waited for the commit, then wrote: the failed commit left
+	// the document missing, so the put of a new document works.
+	if putDoneEarly || put.err != nil || put.rejected != nil {
+		t.Fatalf("the put during the commit: early %v, %+v", putDoneEarly, put)
+	}
+	if after == nil || string(after.Value) != `9` || puts != 1 {
+		t.Fatalf("after the failed commit: document %+v, %d catalog puts; want the put only", after, puts)
+	}
+	if again.err != nil || again.rejected != nil {
+		t.Fatalf("the commit after the failure: %+v", again)
+	}
+	if r := again.result.(CommitResult); !r.Remote || len(r.Seqs) != 1 || r.Seqs[0] != 7 {
+		t.Fatalf("the commit after the failure: %+v", r)
+	}
+	if cont.err != nil || cont.rejected != nil || len(h.exports) != 1 {
+		t.Fatalf("the run did not continue as new: %+v, %d exports", cont, len(h.exports))
+	}
+}
+
+// A commit whose catalog put fails writes nothing and holds nothing: no
+// document, no sequence number, and a later commit and the run's
+// continue-as-new work.
+func TestCommitWriteFailsReleases(t *testing.T) {
+	h := newHarness(t)
+	fail := true
+	h.catalogErr = func(CatalogPutInput) error {
+		if fail {
+			fail = false
+			return temporal.NewNonRetryableApplicationError("The update input is too old.", ErrBound, nil)
+		}
+		return nil
+	}
+	in := func(expected *string) CommitInput {
+		return CommitInput{Bound: h.bound(), Collection: "app-specs", Key: specKey, Value: json.RawMessage(`1`), Expected: expected,
+			Stream: specStream, Events: []NewEvent{{Type: "activity"}}, StreamTarget: wfID}
+	}
+	failed := h.commit(time.Second, func() CommitInput { return in(nil) })
+	var info Info
+	var d *Doc
+	h.env.RegisterDelayedCallback(func() { info = h.info(); d = h.doc("app-specs", specKey) }, 2*time.Second)
+	again := h.commit(3*time.Second, func() CommitInput { return in(nil) })
+	cont := h.update(4*time.Second, UpdateContinue, nil, ContinueInput{Bound: h.bound()})
+	h.env.RegisterDelayedCallback(func() {}, 5*time.Second)
+	h.env.ExecuteWorkflow(EntityWorkflow, EntityInput{})
+
+	if appType(failed.err) != ErrBound {
+		t.Fatalf("the failed commit: %+v", failed)
+	}
+	if d != nil || info.Chain.NextSeq != 1 {
+		t.Fatalf("the failed commit wrote: document %+v, chain %+v", d, info.Chain)
+	}
+	if again.err != nil || again.rejected != nil {
+		t.Fatalf("the commit after the failure: %+v", again)
+	}
+	if r := again.result.(CommitResult); len(r.Seqs) != 1 || r.Seqs[0] != 1 {
+		t.Fatalf("the commit after the failure: %+v", r)
+	}
+	var can *workflow.ContinueAsNewError
+	if cont.err != nil || cont.rejected != nil || !errors.As(h.env.GetWorkflowError(), &can) {
+		t.Fatalf("the run did not continue as new: %+v, %v", cont, h.env.GetWorkflowError())
+	}
+}
+
+// A local commit gives its events their sequence numbers only in the task
+// that completes it. While its catalog put runs, the chain does not move, a
+// stream wait does not end on its events, and an append gets the next
+// number: the visible order is the order of the numbers.
+func TestCommitLocalSeqsAtCompletion(t *testing.T) {
+	h := newHarness(t)
+	h.env.OnActivity(ActivityCatalogPut, mock.Anything, mock.Anything).After(5 * time.Second).Return(nil)
+	commit := h.commit(time.Second, func() CommitInput {
+		return CommitInput{Bound: h.bound(), Collection: "app-specs", Key: specKey, Value: json.RawMessage(`1`),
+			Stream: specStream, Events: []NewEvent{{Type: "activity"}, {Type: "activity"}}, StreamTarget: wfID}
+	})
+	wait := h.update(1500*time.Millisecond, UpdateWait, nil, WaitInput{Bound: Bound{Target: wfID, AtMs: h.env.Now().Add(1500 * time.Millisecond).UnixMilli()}, Stream: specStream, AfterSeq: 0, TimeoutMs: 60_000})
+	var during Info
+	var doc *Doc
+	var waitEarly bool
+	h.env.RegisterDelayedCallback(func() { during = h.info(); doc = h.doc("app-specs", specKey); waitEarly = wait.done }, 2*time.Second)
+	appended := h.update(3*time.Second, UpdateAppend, nil, AppendInput{Bound: Bound{Target: wfID, AtMs: h.env.Now().Add(3 * time.Second).UnixMilli()}, Stream: specStream, Events: []NewEvent{{Type: "sync"}}})
+	var waitAfterAppend bool
+	h.env.RegisterDelayedCallback(func() { waitAfterAppend = wait.done }, 4*time.Second)
+	h.env.RegisterDelayedCallback(func() { h.env.CancelWorkflow() }, 10*time.Second)
+	h.env.ExecuteWorkflow(EntityWorkflow, EntityInput{})
+
+	if during.Chain.NextSeq != 1 || doc != nil || waitEarly {
+		t.Fatalf("during the catalog put: chain %+v, document %+v, wait ended %v", during.Chain, doc, waitEarly)
+	}
+	if appended.err != nil || appended.rejected != nil || appended.result.(AppendResult).Seqs[0] != 1 {
+		t.Fatalf("the append: %+v", appended)
+	}
+	if !waitAfterAppend || wait.result.(WaitResult).Seq != 1 {
+		t.Fatalf("the wait: done %v, %+v", waitAfterAppend, wait)
+	}
+	if commit.err != nil || commit.rejected != nil {
+		t.Fatalf("the commit: %+v", commit)
+	}
+	if r := commit.result.(CommitResult); len(r.Seqs) != 2 || r.Seqs[0] != 2 || r.Seqs[1] != 3 {
+		t.Fatalf("the commit got %+v; want the sequence numbers after the append", r)
+	}
 }
 
 // A delivery that comes again (the Deliver activity tried again) adds no
@@ -220,5 +369,46 @@ func TestDeliveryOnce(t *testing.T) {
 	c := h.exports[0].Chain
 	if c.NextSeq != 3 || len(c.Deliveries) != 1 || c.Deliveries[0] != (Delivery{ID: "doc/x/7", FirstSeq: 1, Count: 2}) {
 		t.Fatalf("chain: %+v", c)
+	}
+}
+
+// A remote commit whose catalog put fails after the delivery stands: the
+// events are delivered and the document is written, so the caller does not
+// send it again. Nothing stays held: the next commit and the continue-as-new
+// work.
+func TestCommitRemoteCatalogFails(t *testing.T) {
+	h := newHarness(t)
+	fail := true
+	h.catalogErr = func(CatalogPutInput) error {
+		if fail {
+			fail = false
+			return temporal.NewNonRetryableApplicationError("The update input is too old.", ErrBound, nil)
+		}
+		return nil
+	}
+	h.env.RegisterActivityWithOptions(func(ctx context.Context, in DeliverInput) (AppendResult, error) {
+		return AppendResult{Nonce: "abc", Seqs: []int64{4}}, nil
+	}, activity.RegisterOptions{Name: ActivityDeliver})
+	in := func(expected *string) CommitInput {
+		return CommitInput{Bound: h.bound(), Collection: "notes", Key: "a", Value: json.RawMessage(`1`), Expected: expected,
+			Stream: "notes-stream", Events: []NewEvent{{Type: "e"}}, StreamTarget: "stream/test/notes-stream", StreamQueue: "q"}
+	}
+	first := h.commit(time.Second, func() CommitInput { return in(nil) })
+	var d *Doc
+	h.env.RegisterDelayedCallback(func() { d = h.doc("notes", "a") }, 2*time.Second)
+	second := h.commit(3*time.Second, func() CommitInput { v := d.Version; return in(&v) })
+	cont := h.update(4*time.Second, UpdateContinue, nil, ContinueInput{Bound: h.bound()})
+	h.env.RegisterDelayedCallback(func() {}, 5*time.Second)
+	h.env.ExecuteWorkflow(EntityWorkflow, EntityInput{})
+
+	if first.err != nil || first.rejected != nil || d == nil || d.Version != first.result.(CommitResult).Version {
+		t.Fatalf("the first commit: %+v, document %+v", first, d)
+	}
+	if second.err != nil || second.rejected != nil || h.catalogPuts != 1 {
+		t.Fatalf("the second commit: %+v, %d catalog puts", second, h.catalogPuts)
+	}
+	var can *workflow.ContinueAsNewError
+	if cont.err != nil || !errors.As(h.env.GetWorkflowError(), &can) {
+		t.Fatalf("the run did not continue as new: %+v, %v", cont, h.env.GetWorkflowError())
 	}
 }

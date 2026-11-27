@@ -162,9 +162,10 @@ func (s *Store) List(ctx context.Context, p protocol.StateListParams) (protocol.
 // "<repoKey>:<slug>") and its stream "spec:<repoKey>:<slug>" have the same
 // workflow (see the route package). Then the document and the events change
 // in one workflow task, and the history holds both or neither. For a
-// document and a stream with two workflows, the update writes the document
-// and then sends the events to the stream's workflow before it completes
-// (see the commit update in the workflows package).
+// document and a stream with two workflows, the update sends the events to
+// the stream's workflow first, and writes the document only after the
+// delivery, so a failed commit writes nothing (see the commit update in the
+// workflows package).
 func (s *Store) Commit(ctx context.Context, p protocol.StateCommitParams) (protocol.StateCommitResult, error) {
 	t := s.router.Doc(p.Collection, p.Key)
 	st := s.router.Stream(p.Stream)

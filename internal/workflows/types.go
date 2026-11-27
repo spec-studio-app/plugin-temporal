@@ -68,6 +68,15 @@ const (
 	ActivityDeliver = "Deliver"
 )
 
+// The change IDs of workflow.GetVersion. A history from before a change
+// replays with the earlier shape.
+const (
+	// ChangeCommitDeliverFirst: a remote commit delivers its events before
+	// it writes the document (version 1). The default version wrote the
+	// document first.
+	ChangeCommitDeliverFirst = "commit-deliver-first"
+)
+
 // The types of the application errors that a validator or a handler gives.
 // The store maps them to protocol errors.
 const (
