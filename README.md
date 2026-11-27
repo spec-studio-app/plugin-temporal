@@ -1,3 +1,177 @@
-# Spec Studio Temporal plugin
+# plugin-temporal
 
-A backend of Spec Studio and its relay that keeps each spec in a Temporal workflow. It gives the spec history, so the app can replay a spec. It implements the protocol in [plugin-sdk](https://github.com/spec-studio-app/plugin-sdk).
+The Temporal backend plugin of Spec Studio. It keeps each spec in one Temporal workflow, for both Spec Studio hosts: the relay and the Mac app. The relay's messages and the app's events go into the same workflow, so each spec has one full history. The app can replay a spec from its start.
+
+The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com/spec-studio-app/plugin-sdk). Read [PROTOCOL.md](https://github.com/spec-studio-app/plugin-sdk/blob/main/PROTOCOL.md) for the calls, the errors and the rules.
+
+## Contents
+
+1. [What the plugin does](#what-the-plugin-does)
+2. [Install](#install)
+3. [Settings](#settings)
+4. [Run with Temporal Cloud](#run-with-temporal-cloud)
+5. [Run with a self-hosted Temporal](#run-with-a-self-hosted-temporal)
+6. [How history and replay work](#how-history-and-replay-work)
+7. [The retention rule and the export](#the-retention-rule-and-the-export)
+8. [Move a relay from its built-in Temporal store](#move-a-relay-from-its-built-in-temporal-store)
+9. [Development](#development)
+
+## What the plugin does
+
+- It gives the capabilities `state`, `events`, `watch` and `blobs` of the protocol version 1.0, and the test hook `continueStream`.
+- It keeps one workflow for each spec, one for each desk and one for the relay config. It uses the relay's workflow IDs and task queues:
+
+  | Data | Workflow ID | Task queue |
+  |---|---|---|
+  | `specs`, `app-specs` and `closed-specs` documents `<repoKey>:<slug>`, and the stream `spec:<repoKey>:<slug>` | `spec-<deploy_id>-<repoKey>-<slug>` | `<task_queue>` |
+  | The `desks` document `<repoKey>`, and the stream `desk:<repoKey>` | `desk-<deploy_id>-<repoKey>` | `<task_queue>` |
+  | The `relay` document `config` | `relay-config-<deploy_id>` | `<task_queue>-config` |
+  | Any other document | `doc/<deploy_id>/<collection>/<key>` | `<task_queue>` |
+  | Any other stream | `stream/<deploy_id>/<stream>` | `<task_queue>` |
+
+- Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes.
+- Each collection has a list workflow, `catalog/<deploy_id>/<collection>`. A list shows each write that returned.
+- The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The relay config uses the config key. All other workflows use the data key.
+- The plugin never writes a key, a secret setting or a payload to its log, to an error or to a result.
+- It keeps blobs (files) in an S3-compatible bucket, or in a local folder.
+- The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker.
+
+The plugin knows no Spec Studio rule. The host applies its rules and stores the result. The plugin knows the relay's names only to choose a workflow.
+
+## Install
+
+With Homebrew (macOS and Linux):
+
+```sh
+brew install spec-studio-app/tap/plugin-temporal
+plugin-temporal --version
+```
+
+Or get an archive from the [releases](https://github.com/spec-studio-app/plugin-temporal/releases): macOS and Linux, arm64 and amd64. Each binary is static.
+
+The host starts the plugin:
+
+```sh
+plugin-temporal                                   # stdio (the app, and the relay by default)
+plugin-temporal --listen 127.0.0.1:7070 --token T # HTTP (a sidecar of the relay)
+```
+
+Over HTTP, set a token with `--token` or `PLUGIN_TOKEN`. Without a token, the plugin listens on a loopback address only.
+
+## Settings
+
+The host sends the settings in the handshake. The names are the relay's settings in lowercase.
+
+| Setting | Required | Secret | Meaning |
+|---|---|---|---|
+| `address` | yes | | The Temporal address, `host:port`. |
+| `namespace` | | | The namespace. Default: `default`. |
+| `auth` | | | `plain`, `tls`, `mtls` or `api-key`. Default: `api-key` when `api_key` is set, `mtls` when `tls_cert` is set, else `plain`. |
+| `api_key` | | yes | The Temporal Cloud API key. |
+| `tls_cert` | | | The mTLS client certificate: PEM text, or the path of a PEM file. |
+| `tls_key` | | yes | The mTLS client key: PEM text, or the path of a PEM file. |
+| `payload_keys` | yes | yes | The payload keys, in the relay's `PAYLOAD_KEYS` format: `data:<id>:<base64 key>,config:<id>:<base64 key>`. The first key of each scope encrypts. Every key decrypts, so you can add a new key in front and keep the old one. `relay keys` makes a value. |
+| `deploy_id` | | | The relay's deploy ID. It is part of each workflow ID. Default: `default`. |
+| `task_queue` | | | The task queue. Default: `relay-<deploy_id>`. |
+| `bucket_endpoint` | | | The URL of an S3-compatible service. |
+| `bucket_name` | | | The bucket. |
+| `bucket_access_key` | | yes | The access key ID. |
+| `bucket_secret_key` | | yes | The secret access key. |
+| `bucket_region` | | | The region. Default: `auto`. |
+| `blob_dir` | | | A local folder for blobs and exports, when you set no bucket. |
+
+Set the four bucket settings, or none. Set a bucket or `blob_dir`.
+
+- On a server, use a bucket. Use the bucket of the relay's attachments if you like: the plugin writes only under `_plugin-temporal/`. A relay deploy ID cannot start with `_`, so the plugin never touches the attachments.
+- The app on one Mac can use `blob_dir`.
+- When the relay and the app share a spec, give them the same bucket. Then each one can read the exports that the other one wrote.
+
+A wrong or missing setting stops the handshake with `bad_settings`, and the message names the setting. A Temporal or a bucket that does not answer gives `unavailable`.
+
+## Run with Temporal Cloud
+
+1. Make an API key in Temporal Cloud for a service account with write access to the namespace.
+2. Get the endpoint of the namespace, for example `my-ns.a1b2c.tmprl.cloud:7233`, or the regional endpoint for API keys.
+3. Set the settings:
+
+   ```sh
+   plugin-conformance \
+     --setting address=my-ns.a1b2c.tmprl.cloud:7233 \
+     --setting namespace=my-ns.a1b2c \
+     --setting api_key="$TEMPORAL_API_KEY" \
+     --setting payload_keys="$PAYLOAD_KEYS" \
+     --setting blob_dir="$HOME/.spec-studio/blobs" \
+     -- plugin-temporal
+   ```
+
+   `plugin-conformance` is the test runner of plugin-sdk. It does a handshake and every call of the protocol. When all tests pass, the plugin works with your namespace. Use a test `deploy_id` for this check, so the test data stays apart from your specs.
+
+For mTLS, set `tls_cert` and `tls_key` in place of `api_key`.
+
+## Run with a self-hosted Temporal
+
+The plugin needs Temporal Server 1.27 or later, because it uses update-with-start. On an older server, the handshake fails with `unavailable` and says the version.
+
+```sh
+temporal server start-dev --headless   # a local dev server, for a test
+plugin-conformance \
+  --setting address=127.0.0.1:7233 \
+  --setting payload_keys="$PAYLOAD_KEYS" \
+  --setting blob_dir=/tmp/blobs \
+  -- plugin-temporal
+```
+
+For a server with TLS, set `auth=tls`. The plugin needs no search attribute.
+
+## How history and replay work
+
+The workflow history is the event log.
+
+- Each `events.append` is one workflow update. The update's input holds the events. Its result holds their sequence numbers and times. Both stay in the history.
+- An `events.read` reads the history of each run of the workflow, takes the completed `append` updates, and returns their events in order.
+- A cursor is opaque. It names the event's sequence number in its chain of runs. A cursor stays valid after a run ends.
+- A read can go by cursor (`after`) or by time (`from` and `to`). An event's time is the host's `at`, or the time that the plugin stored it. The app sets `at` when it sends events late, after it was offline.
+
+The relay and the app write to the same spec workflow. So the relay's messages and the app's activity lines are in one ordered history. The app's scrubber reads the events of a time range, and reads a snapshot of a document from `blobs` by the SHA-256 that an event holds.
+
+## The retention rule and the export
+
+A workflow cannot grow for ever. A run continues as new when Temporal suggests it, or after 2000 updates. A run with no document ends after 7 days with no update. Temporal deletes a closed run after the namespace's retention period (30 days by default on a self-hosted server; set on each namespace in Temporal Cloud).
+
+So that no event is lost:
+
+1. Before a run continues as new or ends, it refuses new updates. The plugin sends a refused update again, and the next run takes it.
+2. The run waits for its updates in progress.
+3. The run exports its own history to the blob store: `exports/<workflow ID>/<run ID>.json.gz`. The export is the Temporal JSON format (the format of `temporal workflow show --output json`), gzipped. The payloads stay encrypted, as Temporal keeps them.
+4. The run writes the chain of runs to `chains/<workflow ID>.json`, and gives the chain to the next run.
+
+The export comes before the run closes. So the retention never removes a run that has no export.
+
+A read follows the chain. It reads a run from Temporal while Temporal has the run, and from its export after that. The host never sees a run boundary. A write to a workflow that ended starts a new run, which reads the chain and links to it.
+
+`events.delete` removes every event of the stream and the exports of its workflow.
+
+## Move a relay from its built-in Temporal store
+
+A relay that used its built-in Temporal store moves to this plugin with the same namespace, workflow IDs, task queues and payload keys. It keeps its data. Each open relay workflow continues as new into the plugin's workflow type, `SpecStudioEntity`, and gives its state as documents. The relay does this once, at start. Read [HANDOFF.md](HANDOFF.md).
+
+## Development
+
+- Go 1.26 or later.
+- `go test ./...`: the unit tests, the workflow tests (the Temporal Go SDK test suite), and the replay tests.
+- The replay tests replay each history in `internal/workflows/testdata/histories`. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh`. Keep the old histories: they must still replay.
+- The integration tests need a Temporal dev server, and for the bucket test an S3-compatible server:
+
+  ```sh
+  temporal server start-dev --headless &
+  scripts/ci-s3.sh   # SeaweedFS on 127.0.0.1:9000 (Docker)
+  TEST_TEMPORAL_ADDRESS=127.0.0.1:7233 \
+  TEST_BUCKET_ENDPOINT=http://127.0.0.1:9000 TEST_BUCKET_NAME=test \
+  TEST_BUCKET_ACCESS_KEY=any TEST_BUCKET_SECRET_KEY=any \
+    go test -tags integration ./...
+  ```
+
+- `scripts/handoff-fixtures.sh` runs the relay's Temporal store with the handoff step, and writes the fixtures of the handoff tests.
+- CI runs the plugin-sdk conformance runner against a dev server, over stdio (with a folder and with a bucket) and over HTTP.
+- A tag `vX.Y.Z` makes a release: the four binaries on the GitHub release, and the formula in [spec-studio-app/homebrew-tap](https://github.com/spec-studio-app/homebrew-tap). The formula push needs the `HOMEBREW_TAP_TOKEN` secret.
+- The test-only flags `--run-limit`, `--idle` and `--catalog-run-limit` make runs continue or end sooner.
