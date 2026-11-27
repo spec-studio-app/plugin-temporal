@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # The plugin-sdk commit of the conformance runner (the same as go.mod).
+  PLUGIN_SDK_COMMIT: 394b06fac3b99e4255f69453ffe51eadf7b94d19
+  TEST_TEMPORAL_ADDRESS: 127.0.0.1:7233
+  TEST_BUCKET_ENDPOINT: http://127.0.0.1:9000
+  TEST_BUCKET_NAME: plugin-temporal-ci
+  TEST_BUCKET_ACCESS_KEY: ci
+  TEST_BUCKET_SECRET_KEY: ci-secret
+
+jobs:
+  test:
+    name: Unit, workflow and replay tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./... && go vet -tags integration ./...
+      - name: Test
+        run: go test -race ./...
+
+  integration:
+    name: Integration tests (Temporal dev server and S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: scripts/ci-temporal.sh
+      - run: scripts/ci-s3.sh
+      - name: Test
+        run: go test -race -count=1 -tags integration ./...
+
+  conformance:
+    name: Conformance (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stdio, blob folder
+            mode: stdio
+            blobs: folder
+          - name: stdio, bucket
+            mode: stdio
+            blobs: bucket
+          - name: HTTP
+            mode: http
+            blobs: folder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/checkout@v4
+        with:
+          repository: spec-studio-app/plugin-sdk
+          ref: ${{ env.PLUGIN_SDK_COMMIT }}
+          path: plugin-sdk
+      - run: scripts/ci-temporal.sh
+      - if: matrix.blobs == 'bucket'
+        run: scripts/ci-s3.sh
+      - name: Build
+        run: |
+          mkdir -p bin
+          go build -o bin/plugin-temporal .
+          (cd plugin-sdk/conformance && go build -o ../../bin/plugin-conformance ./cmd/plugin-conformance)
+      - name: Settings
+        run: |
+          keys="data:ci-d:$(openssl rand -base64 32),config:ci-c:$(openssl rand -base64 32)"
+          echo "::add-mask::$keys"
+          {
+            echo "SETTINGS<<EOF"
+            echo "--setting address=$TEST_TEMPORAL_ADDRESS"
+            echo "--setting payload_keys=$keys"
+            echo "--setting deploy_id=ci-${{ github.run_id }}-${{ strategy.job-index }}"
+            if [ "${{ matrix.blobs }}" = bucket ]; then
+              echo "--setting bucket_endpoint=$TEST_BUCKET_ENDPOINT"
+              echo "--setting bucket_name=$TEST_BUCKET_NAME"
+              echo "--setting bucket_access_key=$TEST_BUCKET_ACCESS_KEY"
+              echo "--setting bucket_secret_key=$TEST_BUCKET_SECRET_KEY"
+            else
+              echo "--setting blob_dir=$RUNNER_TEMP/blobs"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+      - name: Over stdio
+        if: matrix.mode == 'stdio'
+        run: |
+          # shellcheck disable=SC2086
+          bin/plugin-conformance --schemas plugin-sdk/schema $(echo "$SETTINGS" | tr '\n' ' ') -- bin/plugin-temporal
+      - name: Over HTTP
+        if: matrix.mode == 'http'
+        run: |
+          bin/plugin-temporal --listen 127.0.0.1:7070 --token ci-token &
+          for i in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:7070/rpc && break; sleep 0.1; done
+          # shellcheck disable=SC2086
+          bin/plugin-conformance --schemas plugin-sdk/schema --url http://127.0.0.1:7070/rpc --token ci-token $(echo "$SETTINGS" | tr '\n' ' ')
+
+  handoff:
+    name: The handoff from the relay, end to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: scripts/ci-temporal.sh
+      - name: The relay hands off its workflows
+        env:
+          HANDOFF_DEPLOY: e2e${{ github.run_id }}
+        run: scripts/handoff-fixtures.sh "$RUNNER_TEMP/handoff"
+      - name: The plugin takes them over
+        run: HANDOFF_E2E_DIR="$RUNNER_TEMP/handoff" go test -count=1 -tags integration -run TestHandoffEndToEnd -v ./internal/store/
+
+  release-build:
+    name: Release build (dry run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build the four archives
+        run: scripts/build-release.sh 0.0.0-ci dist
+      - name: The formula renders
+        run: |
+          scripts/formula.sh 0.0.0-ci dist/checksums.txt > dist/plugin-temporal.rb
+          ruby -c dist/plugin-temporal.rb
+          tar -xzf dist/plugin-temporal_0.0.0-ci_linux_amd64.tar.gz -C dist
+          test "$(dist/plugin-temporal --version)" = 0.0.0-ci

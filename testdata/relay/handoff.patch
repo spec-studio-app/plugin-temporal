@@ -1,0 +1,268 @@
+diff --git a/src/workflows/desk.ts b/src/workflows/desk.ts
+index 982b010..1f789ce 100644
+--- a/src/workflows/desk.ts
++++ b/src/workflows/desk.ts
+@@ -18,6 +18,7 @@ import {
+ import { checkBound, type Bound } from "./bound.js";
+ import { deskWorkflowId, type DeskMessage, type DeskState } from "./types.js";
+ import { SA } from "./searchAttributes.js";
++import { continueIntoPlugin, deskDocuments, handoffUpdate } from "./handoff.js";
+ import { MAX_WAIT_MS, hasNewer, readCursor, type AckInput, type ReadInput, type RuleEnv, type SendInput } from "./inboxRules.js";
+ import {
+   DESK_REFUSED_TYPE,
+@@ -63,6 +64,12 @@ export async function deskWorkflow(input: DeskState): Promise<void> {
+     updates++;
+     publish();
+   };
++  /** True while the desk moves to plugin-temporal (handoff.ts): every validator refuses. */
++  let closing = false;
++  const open = (b: Bound) => {
++    checkBound(b);
++    if (closing) throw new Error("The desk is moving to plugin-temporal.");
++  };
+   const counted = <T>(out: { result: T; changed: boolean }): T => {
+     if (out.changed) changed();
+     return out.result;
+@@ -71,7 +78,7 @@ export async function deskWorkflow(input: DeskState): Promise<void> {
+   setHandler(deskStateQuery, () => s);
+ 
+   setHandler(deskReportUpdate, (report) => counted(applyReport(s, report)), {
+-    validator: (_: DeskReportInput, b: Bound) => checkBound(b),
++    validator: (_: DeskReportInput, b: Bound) => open(b),
+   });
+ 
+   setHandler(
+@@ -83,17 +90,17 @@ export async function deskWorkflow(input: DeskState): Promise<void> {
+     },
+     {
+       validator: (_: SendInput, b: Bound) => {
+-        checkBound(b);
++        open(b);
+         const refusal = deskRefusal(s);
+         if (refusal) throw ApplicationFailure.nonRetryable(refusal, DESK_REFUSED_TYPE);
+       },
+     },
+   );
+ 
+-  setHandler(deskAckUpdate, (ack) => counted(applyDeskAck(s, ack, env)), { validator: (_: AckInput, b: Bound) => checkBound(b) });
++  setHandler(deskAckUpdate, (ack) => counted(applyDeskAck(s, ack, env)), { validator: (_: AckInput, b: Bound) => open(b) });
+ 
+   setHandler(deskSyncUpdate, (sync) => counted(applyDeskSync(s, sync, env)), {
+-    validator: (_: DeskSyncInput, b: Bound) => checkBound(b),
++    validator: (_: DeskSyncInput, b: Bound) => open(b),
+   });
+ 
+   setHandler(
+@@ -105,12 +112,20 @@ export async function deskWorkflow(input: DeskState): Promise<void> {
+       }
+       return counted(collectDeskRead(s, after));
+     },
+-    { validator: (_: ReadInput, b: Bound) => checkBound(b) },
++    { validator: (_: ReadInput, b: Bound) => open(b) },
+   );
+ 
++  // The handoff to plugin-temporal (handoff.ts).
++  let handoff = false;
++  setHandler(handoffUpdate, () => {
++    handoff = true;
++  }, { validator: (b: Bound) => open(b) });
++
+   publish();
+ 
+-  await condition(() => updates >= s.updateLimit || workflowInfo().continueAsNewSuggested);
++  await condition(() => updates >= s.updateLimit || workflowInfo().continueAsNewSuggested || handoff);
++  if (handoff) closing = true;
+   await condition(allHandlersFinished);
++  if (handoff) await continueIntoPlugin(workflowInfo().workflowId, deskDocuments(s));
+   await continueAsNew<typeof deskWorkflow>(s);
+ }
+diff --git a/src/workflows/handoff.ts b/src/workflows/handoff.ts
+new file mode 100644
+index 0000000..34b08cf
+--- /dev/null
++++ b/src/workflows/handoff.ts
+@@ -0,0 +1,77 @@
++// The handoff to plugin-temporal (https://github.com/spec-studio-app/plugin-temporal,
++// HANDOFF.md). An open relay workflow continues as new into the plugin's
++// workflow type, with the same workflow ID and task queue, and passes its
++// state as the plugin's documents. The plugin knows no relay rule: the
++// documents and their attributes come from here, as the relay's protocol
++// adapter writes them (PROTOCOL.md section 14 in spec-studio-app/plugin-sdk).
++//
++// This file runs in the workflow sandbox: keep it free of Node APIs.
++import { defineUpdate, makeContinueAsNewFunc } from "@temporalio/workflow";
++import type { Bound } from "./bound.js";
++import type { DeskState, RelayConfigState, SpecWorkflowState } from "./types.js";
++import { specMemo } from "./specRules.js";
++import { deskMemo } from "./deskRules.js";
++
++/** The plugin's workflow type. */
++export const PLUGIN_WORKFLOW_TYPE = "SpecStudioEntity";
++
++export type Attributes = Record<string, string | number | boolean | null>;
++
++export interface HandoffDoc {
++  collection: string;
++  key: string;
++  value: unknown;
++  attributes: Attributes;
++}
++
++export interface HandoffInput {
++  handoff: { version: 1; workflowId: string; documents: HandoffDoc[] };
++}
++
++/** Ask an open relay workflow to continue as new into the plugin. */
++export const handoffUpdate = defineUpdate<void, [Bound]>("handoff");
++
++export function specDocuments(s: SpecWorkflowState): HandoffDoc[] {
++  const memo = specMemo(s);
++  return [
++    {
++      collection: "specs",
++      key: `${s.spec.repoKey}:${s.spec.slug}`,
++      value: s,
++      attributes: {
++        repoKey: s.spec.repoKey,
++        open: memo.stage !== "merged",
++        pendingForMac: memo.waitingForMac > 0,
++        pendingForCoordinator: memo.unreadForCoordinator > 0,
++        deployId: s.deployId,
++      },
++    },
++  ];
++}
++
++export function deskDocuments(s: DeskState): HandoffDoc[] {
++  const memo = deskMemo(s);
++  return [
++    {
++      collection: "desks",
++      key: s.desk.repoKey,
++      value: s,
++      attributes: {
++        repoKey: s.desk.repoKey,
++        pendingForMac: memo.waitingForMac > 0,
++        pendingForCoordinator: memo.unreadForCoordinator > 0,
++        deployId: s.deployId,
++      },
++    },
++  ];
++}
++
++export function configDocuments(s: RelayConfigState): HandoffDoc[] {
++  return [{ collection: "relay", key: "config", value: s, attributes: {} }];
++}
++
++/** Continue as new into the plugin's workflow. It never returns. */
++export async function continueIntoPlugin(workflowId: string, documents: HandoffDoc[]): Promise<never> {
++  const toPlugin = makeContinueAsNewFunc<(input: HandoffInput) => Promise<void>>({ workflowType: PLUGIN_WORKFLOW_TYPE });
++  return toPlugin({ handoff: { version: 1, workflowId, documents } });
++}
+diff --git a/src/workflows/relayConfig.ts b/src/workflows/relayConfig.ts
+index c065ecb..29b84c6 100644
+--- a/src/workflows/relayConfig.ts
++++ b/src/workflows/relayConfig.ts
+@@ -13,6 +13,7 @@ import {
+ import { checkBound, type Bound } from "./bound.js";
+ import { relayConfigWorkflowId, type RelayConfigState, type StoredClient, type StoredToken } from "./types.js";
+ import * as rules from "./configRules.js";
++import { configDocuments, continueIntoPlugin, handoffUpdate } from "./handoff.js";
+ import type { TokenPair } from "./configRules.js";
+ 
+ export { NOT_PAIRED, type TokenPair } from "./configRules.js";
+@@ -36,10 +37,10 @@ export const clientQuery = defineQuery<StoredClient | null, [string]>("client");
+ export const reposQuery = defineQuery<RelayConfigState["repos"]>("repos");
+ export const pairedQuery = defineQuery<number>("paired");
+ /** True when the hash is the live pairing code. It does not use the code. */
++/** The whole state (the handoff fixtures of plugin-temporal compare it). */
++export const configStateQuery = defineQuery<RelayConfigState>("state");
+ export const pairCodeQuery = defineQuery<boolean, [string]>("pairCodeValid");
+ 
+-/** Every update of the relay-config workflow is bound to it (see bound.ts). */
+-const bound = { validator: (_: unknown, b: Bound) => checkBound(b) };
+ 
+ export async function relayConfigWorkflow(input: RelayConfigState): Promise<void> {
+   const s = input;
+@@ -47,6 +48,14 @@ export async function relayConfigWorkflow(input: RelayConfigState): Promise<void
+   // A start input copied from another deploy's workflow: end at once.
+   if (workflowInfo().workflowId !== relayConfigWorkflowId(s.deployId)) return;
+ 
++  /** True while the config moves to plugin-temporal (handoff.ts): every validator refuses. */
++  let closing = false;
++  /** Every update of the relay-config workflow is bound to it (see bound.ts). */
++  const open = (b: Bound) => {
++    checkBound(b);
++    if (closing) throw new Error("The relay config is moving to plugin-temporal.");
++  };
++  const bound = { validator: (_: unknown, b: Bound) => open(b) };
+   const sweep = () => rules.sweep(s, Date.now());
+   const changed = () => {
+     updates++;
+@@ -70,7 +79,7 @@ export async function relayConfigWorkflow(input: RelayConfigState): Promise<void
+   // The validator refuses an unpair that removes nothing, so it adds no event to the history.
+   setHandler(unpairUpdate, ({ secretHash }) => counted(rules.unpair(s, secretHash)), {
+     validator: ({ secretHash }, b) => {
+-      checkBound(b);
++      open(b);
+       if (!rules.isPaired(s, secretHash)) throw new Error(rules.NOT_PAIRED);
+     },
+   });
+@@ -82,8 +91,17 @@ export async function relayConfigWorkflow(input: RelayConfigState): Promise<void
+   setHandler(revokeUpdate, (input) => counted(rules.revoke(s, input)), bound);
+   setHandler(setReposUpdate, (repos) => counted(rules.setRepos(s, repos)), bound);
+ 
+-  await condition(() => updates >= s.updateLimit || workflowInfo().continueAsNewSuggested);
++  // The handoff to plugin-temporal (handoff.ts).
++  let handoff = false;
++  setHandler(configStateQuery, () => s);
++  setHandler(handoffUpdate, () => {
++    handoff = true;
++  }, { validator: (b: Bound) => open(b) });
++
++  await condition(() => updates >= s.updateLimit || workflowInfo().continueAsNewSuggested || handoff);
++  if (handoff) closing = true;
+   await condition(allHandlersFinished);
+   sweep();
++  if (handoff) await continueIntoPlugin(workflowInfo().workflowId, configDocuments(s));
+   await continueAsNew<typeof relayConfigWorkflow>(s);
+ }
+diff --git a/src/workflows/spec.ts b/src/workflows/spec.ts
+index 1586981..9111da1 100644
+--- a/src/workflows/spec.ts
++++ b/src/workflows/spec.ts
+@@ -17,6 +17,7 @@ import type { Activities } from "../activities.js";
+ import { checkBound, type Bound } from "./bound.js";
+ import { CLOSING_TEXT, FINISHED_GRACE_MS, specWorkflowId, type Message, type SpecWorkflowState } from "./types.js";
+ import { SA } from "./searchAttributes.js";
++import { continueIntoPlugin, handoffUpdate, specDocuments } from "./handoff.js";
+ import {
+   MAX_WAIT_MS,
+   applyAck,
+@@ -153,13 +154,25 @@ export async function specWorkflow(input: SpecWorkflowState): Promise<void> {
+     return counted(collectRead(s, after));
+   }, { validator: (_: ReadInput, b: Bound) => open(b) });
+ 
++  // The handoff to plugin-temporal (handoff.ts). An update that a relay from
++  // before the handoff never sends, so old histories replay the same.
++  let handoff = false;
++  setHandler(handoffUpdate, () => {
++    handoff = true;
++  }, { validator: (b: Bound) => open(b) });
++
+   publish();
+ 
+   const done = () => isDone(s);
+   const tooLong = () => updates >= s.updateLimit || workflowInfo().continueAsNewSuggested;
+ 
+   for (;;) {
+-    await condition(() => done() || tooLong());
++    await condition(() => done() || tooLong() || handoff);
++    if (handoff) {
++      closing = true;
++      await condition(allHandlersFinished);
++      await continueIntoPlugin(workflowInfo().workflowId, specDocuments(s));
++    }
+     if (!tooLong()) {
+       // A finished spec with empty inboxes: wait the grace period. Any update
+       // in it (a read, a late line, a message) starts it again.

@@ -1,0 +1,11 @@
+{
+  "keyId": "data-test",
+  "keyBase64": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "metadata": {
+    "encoding": "binary/encrypted",
+    "encryption-key-id": "data-test"
+  },
+  "dataBase64": "NdGYiNUEBrTMpo+UizSglrZlVS7eoL4flLijOa/xvh0Diw2ctwm6TtkFZoDzKrAvFfVoxXRewRGFBEJwpw+0fNe/dq0Nv+AbScu783Q=",
+  "plainEncoding": "json/plain",
+  "plainData": "{\"hello\":\"relay\",\"n\":1}"
+}

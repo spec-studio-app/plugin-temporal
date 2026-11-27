@@ -1,0 +1,11 @@
+{
+  "dataBase64": "MmdgyZxeKhpvjF7aNNGCihRKzmoDYkwqXs6saXYfdVKcO+37w2Z0+ngYYfP5wDuS75evfoi0/rqBxd07K+akT6FA0RqMT2MbsKifxs8LQgHu5pUM6KxT",
+  "keyBase64": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
+  "keyId": "go-test",
+  "metadata": {
+    "encoding": "binary/encrypted",
+    "encryption-key-id": "go-test"
+  },
+  "plainData": "{\"hello\":\"plugin-temporal\",\"n\":2}",
+  "plainEncoding": "json/plain"
+}
