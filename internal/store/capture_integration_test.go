@@ -14,6 +14,8 @@ import (
 	"go.temporal.io/api/temporalproto"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
+
+	"github.com/spec-studio-app/plugin-temporal/internal/workflows"
 )
 
 // TestCaptureHistories writes the histories of the replay tests to
@@ -100,12 +102,15 @@ func TestCaptureHistories(t *testing.T) {
 
 // save writes a history, and its workflow ID next to it (<name>.id): the
 // workflows check their input against their workflow ID, so the replay needs it.
+// The repo is public: save replaces the worker identities and the sticky task
+// queue names, which hold this computer's name (workflows.ScrubHistory).
 func save(t *testing.T, name, workflowID string, events []*historypb.HistoryEvent) {
 	t.Helper()
 	b, err := temporalproto.CustomJSONMarshalOptions{Indent: " "}.Marshal(&historypb.History{Events: events})
 	if err != nil {
 		t.Fatal(err)
 	}
+	b = workflows.ScrubHistory(b)
 	var check map[string]any
 	if err := json.Unmarshal(b, &check); err != nil {
 		t.Fatal(err)
