@@ -134,8 +134,8 @@ For a server with TLS, set `auth=tls`. The plugin needs no search attribute.
 
 The workflow history is the event log.
 
-- Each `events.append` is one workflow update. The update's input holds the events. Its result holds their sequence numbers and times. Both stay in the history.
-- An `events.read` reads the history of each run of the workflow, takes the completed `append` updates, and returns their events in order.
+- Each `events.append` is one workflow update, and each `state.commit` with events is one `commit` update (see below). The update's input holds the events. Its result holds their sequence numbers and times. Both stay in the history.
+- An `events.read` reads the history of each run of the workflow, takes the completed `append` and `commit` updates of the stream, and returns their events in order. A `commit` whose events went to the workflow of another stream (its result says `remote`) has no event in this history: the stream's workflow has them as an `append`. The app writes its activity lines with `state.commit`, so a spec's history has most of its events in `commit` updates.
 - A cursor is opaque. It names the event's sequence number in its chain of runs. A cursor stays valid after a run ends.
 - A read can go by cursor (`after`) or by time (`from` and `to`). An event's time is the host's `at`, or the time that the plugin stored it. The app sets `at` when it sends events late, after it was offline.
 
