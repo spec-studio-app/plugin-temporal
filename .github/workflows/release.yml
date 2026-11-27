@@ -1,0 +1,72 @@
+name: Release
+
+# A tag vX.Y.Z publishes:
+# - the four static binaries (macOS and Linux, arm64 and amd64) and their
+#   checksums, on the GitHub release vX.Y.Z;
+# - the Homebrew formula Formula/plugin-temporal.rb in spec-studio-app/homebrew-tap
+#   (needs the HOMEBREW_TAP_TOKEN secret: a token that can push to the tap).
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: GitHub release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: scripts/build-release.sh "${GITHUB_REF_NAME#v}" dist
+      - name: Check the version
+        run: |
+          tar -xzf "dist/plugin-temporal_${GITHUB_REF_NAME#v}_linux_amd64.tar.gz" -C "$RUNNER_TEMP"
+          test "$("$RUNNER_TEMP/plugin-temporal" --version)" = "${GITHUB_REF_NAME#v}"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes dist/*.tar.gz dist/checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: dist/checksums.txt
+
+  formula:
+    name: Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: checksums
+          path: dist
+      - uses: actions/checkout@v4
+        with:
+          repository: spec-studio-app/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Push the formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p tap/Formula
+          scripts/formula.sh "$version" dist/checksums.txt > tap/Formula/plugin-temporal.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/plugin-temporal.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "plugin-temporal ${version}"
+          git push

@@ -59,8 +59,8 @@ The fixtures: `testdata/relay/` has a Node script that checks out the relay at a
 - **One workflow type for all targets**, with the target in the input. The relay's three types become one, because the plugin knows no rule.
 - **Update-with-start** needs Temporal Server 1.27 or later (or Temporal Cloud). The README says so, and the handshake checks the server version and answers `unavailable` with that message on an older server.
 - **Prefix in the bucket: `_plugin-temporal/`.** A relay deploy ID cannot start with `_`, so it never touches the relay's attachments (`<deployId>/…`). In `blob_dir`: `blobs/`, `exports/` and `chains/`.
-- **GoReleaser** builds the release and pushes the formula to the tap with the `HOMEBREW_TAP_TOKEN` secret, as the app's pipeline updates its cask. The tap's PR adds the README row; the first release writes `Formula/plugin-temporal.rb`.
-- **Go 1.24** (the SDK's CI uses 1.24). Temporal Go SDK `go.temporal.io/sdk` at its latest release.
+- **Two small scripts, not GoReleaser** (changed in Build): `scripts/build-release.sh` builds the four archives and the checksums, and `scripts/formula.sh` writes the formula. GoReleaser's formula output (`brews`) is deprecated in favor of casks, and the spec asks for a formula. The release workflow pushes the formula to the tap with the `HOMEBREW_TAP_TOKEN` secret, as the app's pipeline updates its cask. The tap's PR adds the README row; the first release writes `Formula/plugin-temporal.rb`.
+- **Go 1.26** (changed in Build: the latest Temporal Go SDK and minio-go need Go 1.26). Temporal Go SDK `go.temporal.io/sdk` v1.52.
 
 ## Repos
 | Repo | Why it changes | Merge order |
@@ -78,7 +78,7 @@ The fixtures: `testdata/relay/` has a Node script that checks out the relay at a
 7. plugin-temporal: replay tests: `testdata/histories/` from the workflow tests and the dev-server tests, `replay_test.go`, and `scripts/capture-histories.sh` to save new ones on purpose. Covers R11.
 8. plugin-temporal: the handoff fixtures (`testdata/relay/`, `handoff.patch`, the Node script), `HANDOFF.md`, and the Go tests that read them. Covers R10.
 9. plugin-temporal: CI (`.github/workflows/ci.yml`): vet and unit tests; integration tests with `temporal server start-dev` and a MinIO service; the conformance runner built from plugin-sdk at the pinned commit, over stdio (with `blob_dir` and with the bucket) and over HTTP; the end-to-end handoff job. Covers R12, R9, R10.
-10. plugin-temporal: release (`.goreleaser.yaml`, `.github/workflows/release.yml`): four static binaries, checksums, the version in `--version`, and the formula push to the tap. Covers R13.
+10. plugin-temporal: release (`scripts/build-release.sh`, `scripts/formula.sh`, `.github/workflows/release.yml`): four static binaries, checksums, the version in `--version`, and the formula push to the tap. Covers R13.
 11. plugin-temporal: the README in ASD-STE100: what it does, the settings, history and replay, retention and the export, the handoff, Temporal Cloud and self-hosted, the server version, and the link to plugin-sdk. No license. Covers R14.
 12. homebrew-tap: the README row for `plugin-temporal` (`brew install spec-studio-app/tap/plugin-temporal`) and a line that the plugin's release pipeline writes the formula. Covers R13.
 
@@ -120,7 +120,7 @@ The fixtures: `testdata/relay/` has a Node script that checks out the relay at a
 - R10.S4: workflow test: an input whose `workflowId` is another ID ends the run with no document and no catalog entry.
 - R11.S1: `internal/workflows/replay_test.go` replays every file in `testdata/histories/` with `worker.NewWorkflowReplayer`; a check of the test makes a non-deterministic copy of the workflow and expects the replay to fail with the file name.
 - R12.S1: the CI jobs `conformance-stdio` and `conformance-http`.
-- R13.S1: the release workflow on a tag; checked by `goreleaser release --snapshot --clean` in CI, and by the first real tag after merge (a person pushes it).
+- R13.S1: the release workflow on a tag; checked in CI by the `release-build` job (the four archives, the checksums, the formula, `--version`), and by the first real tag after merge (a person pushes it).
 - R13.S2: a manual check after the first release: `brew install spec-studio-app/tap/plugin-temporal` and `plugin-temporal --version`.
 - R14.S1: a review of the README against the steps that the CI jobs run (the same settings and commands).
 
