@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
@@ -191,4 +192,14 @@ func (s *Store) Commit(ctx context.Context, p protocol.StateCommitParams) (proto
 		out.Cursors[i] = history.Cursor(res.Nonce, seq)
 	}
 	return out, nil
+}
+
+// StoreID is the storeId of the handshake: "temporal:<address>/<namespace>/<deploy ID>".
+// Two processes with the same address, namespace and deploy ID use the same
+// workflows, so they give the same value. The address is in lowercase.
+func (s *Store) StoreID() string {
+	if s.set == nil {
+		return ""
+	}
+	return "temporal:" + strings.ToLower(strings.TrimSpace(s.set.Address)) + "/" + s.set.Namespace + "/" + s.set.DeployID
 }

@@ -219,3 +219,16 @@ func TestCommitRaceTwoProcesses(t *testing.T) {
 		t.Fatalf("the stream has %v", got)
 	}
 }
+
+// R10: the storeId names the address, the namespace and the deploy ID.
+func TestStoreID(t *testing.T) {
+	e := newEnv(t)
+	s := e.open(Options{})
+	want := "temporal:" + strings.ToLower(e.settings["address"]) + "/default/" + e.deploy
+	if got := s.StoreID(); got != want {
+		t.Fatalf("storeId %q; want %q", got, want)
+	}
+	if got := e.open(Options{}).StoreID(); got != want {
+		t.Fatalf("a second process gives %q", got)
+	}
+}

@@ -69,6 +69,7 @@ var (
 	_ plugin.StreamContinuer = (*Store)(nil)
 	_ plugin.Durable         = (*Store)(nil)
 	_ plugin.Committer       = (*Store)(nil)
+	_ plugin.StoreIdentity   = (*Store)(nil)
 )
 
 // Durable is true: Temporal and the blob store keep the data.

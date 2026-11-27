@@ -22,6 +22,7 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 ## What the plugin does
 
 - It speaks the protocol versions 1.0 and 1.1. It gives the capabilities `state`, `events`, `watch` and `blobs`, the call `state.commit` of 1.1 (see [state.commit](#statecommit)), and the test hook `continueStream`.
+- When the handshake chooses 1.1, the result has `storeId`: `temporal:<address>/<namespace>/<deploy_id>`, from the settings (the address in lowercase). Two plugin processes with the same address, namespace and deploy ID use the same workflows, so they give the same `storeId`. The app and the relay compare it to know that they share one store.
 - It keeps one workflow for each spec, one for each desk and one for the relay config. It uses the relay's workflow IDs and task queues:
 
   | Data | Workflow ID | Task queue |
