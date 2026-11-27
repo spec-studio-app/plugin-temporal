@@ -109,6 +109,10 @@ func historyOf(t *testing.T, c client.Client, wfID, runID string) []*historypb.H
 	return out
 }
 
+func ctxWithTimeout(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func ctx(t *testing.T) context.Context {
