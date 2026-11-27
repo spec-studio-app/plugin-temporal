@@ -1,0 +1,203 @@
+{
+  "keys": "data:fx-d:kjCqy6sZlpuf/NwhYB7JMRNFcgiSgRDpr6ux/EtCA7c=,config:fx-c:xUH0kCfiUlPf66oGhDenQBg9B9x4DOWIsLEIjQZvr3k=",
+  "deployId": "fixture",
+  "workflows": [
+    {
+      "name": "spec",
+      "workflowId": "spec-fixture-3c7bdc395f84-fix-login",
+      "taskQueue": "relay-fixture",
+      "scope": "data",
+      "relayRunId": "01a21d9b-ac30-7c29-8a07-416a2c6c8335",
+      "documents": [
+        {
+          "collection": "specs",
+          "key": "3c7bdc395f84:fix-login",
+          "value": {
+            "deployId": "fixture",
+            "spec": {
+              "repoKey": "3c7bdc395f84",
+              "slug": "fix-login",
+              "repo": "/Users/me/code/fixture-app"
+            },
+            "state": {
+              "slug": "fix-login",
+              "title": "Fix login",
+              "stage": "build",
+              "status": "working",
+              "mode": "autopilot",
+              "createdAt": "2026-11-27T09:00:00Z"
+            },
+            "turn": null,
+            "line": 3,
+            "syncedAt": "2026-11-27T15:24:31.282Z",
+            "events": [
+              {
+                "line": 1,
+                "event": {
+                  "t": "2026-11-27T10:00:00Z",
+                  "kind": "status"
+                }
+              },
+              {
+                "line": 2,
+                "event": {
+                  "t": "2026-11-27T10:01:00Z",
+                  "kind": "message",
+                  "id": "r1",
+                  "text": "CI is green on main."
+                }
+              },
+              {
+                "line": 3,
+                "event": {
+                  "t": "2026-11-27T10:02:00Z",
+                  "kind": "status"
+                }
+              }
+            ],
+            "mac": {
+              "nextSeq": 2,
+              "messages": [
+                {
+                  "id": "0e78b1d6-94a2-494d-886e-723a96e9997e",
+                  "seq": 1,
+                  "from": "coordinator",
+                  "spec": {
+                    "repoKey": "3c7bdc395f84",
+                    "slug": "fix-login"
+                  },
+                  "stage": "",
+                  "text": "How is it going?",
+                  "createdAt": "2026-11-27T15:24:31.305Z"
+                }
+              ]
+            },
+            "coordinator": {
+              "nextSeq": 2,
+              "messages": [
+                {
+                  "id": "r1",
+                  "from": "session",
+                  "spec": {
+                    "repoKey": "3c7bdc395f84",
+                    "slug": "fix-login"
+                  },
+                  "stage": "build",
+                  "text": "CI is green on main.",
+                  "createdAt": "2026-11-27T10:01:00Z",
+                  "seq": 1
+                }
+              ],
+              "readUpTo": 0
+            },
+            "finished": false,
+            "updateLimit": 2000,
+            "graceMs": 3600000,
+            "lastStatusAt": "2026-11-27T10:02:00Z",
+            "lastStatusLine": 3,
+            "lastMessageLine": 2,
+            "lastSentAt": "2026-11-27T15:24:31.305Z"
+          },
+          "attributes": {
+            "repoKey": "3c7bdc395f84",
+            "open": true,
+            "pendingForMac": true,
+            "pendingForCoordinator": true,
+            "deployId": "fixture"
+          }
+        }
+      ]
+    },
+    {
+      "name": "desk",
+      "workflowId": "desk-fixture-3c7bdc395f84",
+      "taskQueue": "relay-fixture",
+      "scope": "data",
+      "relayRunId": "01a21d9b-ad0f-7772-b41d-837c0eaaa779",
+      "documents": [
+        {
+          "collection": "desks",
+          "key": "3c7bdc395f84",
+          "value": {
+            "deployId": "fixture",
+            "desk": {
+              "repoKey": "3c7bdc395f84",
+              "repo": "/Users/me/code/fixture-app"
+            },
+            "open": true,
+            "turn": {
+              "turn": "idle",
+              "needsYou": false
+            },
+            "canMessage": true,
+            "reason": null,
+            "stateAt": "2026-11-27T15:24:31.371Z",
+            "line": 0,
+            "mac": {
+              "nextSeq": 2,
+              "messages": [
+                {
+                  "id": "323c963d-1e0f-45cf-ab19-745f0b52f925",
+                  "seq": 1,
+                  "from": "coordinator",
+                  "desk": {
+                    "repoKey": "3c7bdc395f84",
+                    "repo": "/Users/me/code/fixture-app"
+                  },
+                  "text": "Is CI green on main?",
+                  "createdAt": "2026-11-27T15:24:31.429Z"
+                }
+              ]
+            },
+            "coordinator": {
+              "nextSeq": 1,
+              "messages": [],
+              "readUpTo": 0
+            },
+            "updateLimit": 2000
+          },
+          "attributes": {
+            "repoKey": "3c7bdc395f84",
+            "pendingForMac": true,
+            "pendingForCoordinator": false,
+            "deployId": "fixture"
+          }
+        }
+      ]
+    },
+    {
+      "name": "config",
+      "workflowId": "relay-config-fixture",
+      "taskQueue": "relay-fixture-config",
+      "scope": "config",
+      "relayRunId": "01a21d9b-ad6f-7da0-914c-9ffec9b29296",
+      "documents": [
+        {
+          "collection": "relay",
+          "key": "config",
+          "value": {
+            "deployId": "fixture",
+            "agents": [
+              {
+                "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "pairedAt": "2026-11-27T10:03:00.000Z"
+              }
+            ],
+            "pairCode": null,
+            "clients": [],
+            "access": {},
+            "refresh": {},
+            "repos": {
+              "repos": [
+                "/Users/me/code/fixture-app"
+              ],
+              "at": "2026-11-27T10:04:00.000Z"
+            },
+            "updateLimit": 500
+          },
+          "attributes": {}
+        }
+      ]
+    }
+  ]
+}

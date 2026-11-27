@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"go.temporal.io/api/temporalproto"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/temporalproto"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
 )
