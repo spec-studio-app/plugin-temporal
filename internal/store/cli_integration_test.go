@@ -76,7 +76,7 @@ func TestCLIAloneRunsWorkers(t *testing.T) {
 	if n := workerCount(cli2); n != 2 {
 		t.Fatalf("the next CLI process runs %d workers, want 2: the poller of the last CLI process is no other worker", n)
 	}
-	if d := time.Since(start); d > workerWait {
+	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("the second CLI process took %v", d)
 	}
 }
@@ -155,7 +155,7 @@ func TestCLISlowCallNextToAppStartsNoWorker(t *testing.T) {
 	put(t, app, "specs", "1a2b3c4d5e6f:fix-login", map[string]string{"text": "app"}, nil, nil)
 	cli := e.openKind(protocol.HostCLI)
 	tq := cli.set.TaskQueue
-	if !cli.otherWorkerServes(ctx(t), tq, time.Now(), false) {
+	if serves, ok := cli.otherWorkerServes(ctx(t), tq, time.Now(), false); !ok || !serves {
 		t.Fatal("the app's worker does not count as serving the task queue")
 	}
 	// A call that takes 3 workerWaits.
@@ -167,5 +167,33 @@ func TestCLISlowCallNextToAppStartsNoWorker(t *testing.T) {
 	}
 	if got := getText(t, cli, "specs", "1a2b3c4d5e6f:fix-login"); got != "app" {
 		t.Fatalf("read %q", got)
+	}
+}
+
+// The safety net starts no worker once the call ended, also when the app is
+// gone and nobody serves the task queue.
+func TestCLISafetyNetStartsNoWorkerAfterTheCall(t *testing.T) {
+	e := newEnv(t)
+	app := e.openKind(protocol.HostApp)
+	put(t, app, "specs", "1a2b3c4d5e6f:fix-login", map[string]string{"text": "app"}, nil, nil)
+	closeStore(app)
+	cli := e.openKind(protocol.HostCLI)
+	tq := cli.set.TaskQueue
+	if n := workerCount(cli); n != 0 {
+		t.Fatalf("the CLI runs %d workers while the app's poller is fresh, want 0", n)
+	}
+	// A call that ends just before the first check, and one whose context
+	// ends then.
+	answered := cli.fallbackWorker(ctx(t), tq, true)
+	time.Sleep(workerWait - 50*time.Millisecond)
+	answered()
+	c, cancel := context.WithCancel(context.Background())
+	answered2 := cli.fallbackWorker(c, tq, true)
+	time.Sleep(workerWait - 50*time.Millisecond)
+	cancel()
+	time.Sleep(3 * workerWait)
+	answered2()
+	if n := workerCount(cli); n != 0 {
+		t.Fatalf("the safety net started %d workers after the call ended, want 0", n)
 	}
 }

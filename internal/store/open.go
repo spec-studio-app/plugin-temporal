@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
@@ -72,8 +71,6 @@ type Store struct {
 	// started is the time that each worker started.
 	started map[string]time.Time
 	closed  bool
-	// activities counts the activities in progress in this process's workers.
-	activities atomic.Int64
 }
 
 // New makes a store. Open connects it, and reads the options then (after the
@@ -272,17 +269,17 @@ func (s *Store) openBlobs(ctx context.Context) error {
 	return nil
 }
 
-// stopWorkers stops the workers, all at once. Stop is graceful: it tells
-// Temporal that the worker stops, so Temporal gives its sticky workflows to
-// another worker at once, and it lets the activities in progress end
-// (WorkerStopTimeout). No worker starts after it.
+// stopWorkers stops the workers, all at once, and returns when they
+// stopped. Stop is graceful: it tells Temporal that the worker stops, so
+// Temporal gives its sticky workflows to another worker at once, and it
+// waits for the activities in progress to end and report (WorkerStopTimeout).
+// No worker starts after it.
 func (s *Store) stopWorkers() {
 	s.wmu.Lock()
 	ws := s.workers
 	s.workers = nil
 	s.closed = true
 	s.wmu.Unlock()
-	busy := s.activities.Load() > 0
 	var wg sync.WaitGroup
 	for _, w := range ws {
 		wg.Add(1)
@@ -292,9 +289,6 @@ func (s *Store) stopWorkers() {
 		}()
 	}
 	wg.Wait()
-	if busy {
-		s.awaitActivities()
-	}
 }
 
 func (s *Store) closeClients() {
