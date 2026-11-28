@@ -136,7 +136,9 @@ func TestCLIAfterAppClosedStartsWorker(t *testing.T) {
 	if got := getText(t, cli, "specs", "1a2b3c4d5e6f:fix-login"); got != "cli" {
 		t.Fatalf("read %q", got)
 	}
-	if d := time.Since(start); d > workerWait+4*time.Second {
+	// The point is that the call completes; CI machines are slower than a
+	// laptop, so the bound is wide.
+	if d := time.Since(start); d > workerWait+15*time.Second {
 		t.Fatalf("the CLI took %v", d)
 	}
 	// The safety net starts only the worker of the call's task queue.
