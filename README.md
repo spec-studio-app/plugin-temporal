@@ -41,7 +41,16 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 - The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The workflows of the `relay` collection (the relay config, other `relay` documents and their list workflow) use the config key. All other workflows use the data key.
 - The plugin never writes a key, a secret setting or a payload to its log, to an error or to a result.
 - It keeps blobs (files) in an S3-compatible bucket, or in a local folder.
-- The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker.
+- The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker. The worker depends on the host kind of the handshake (see [The workers by host kind](#the-workers-by-host-kind)).
+
+### The workers by host kind
+
+- `app`, `relay` and `test`: the plugin starts a worker on the data task queue and one on the config task queue when it opens, and runs them until its shutdown.
+- `cli` (the `studio` CLI starts one plugin process for each command): the plugin is a Temporal client first. It starts the worker of a task queue only when it needs it:
+  - when it opens, if Temporal saw no other worker poll the task queue in the last 90 seconds (the app and the relay are closed). Then nobody else runs the workflows, so the CLI's calls need this worker.
+  - when a call gets no answer in 1 second (for example, the app closed a moment ago, and Temporal still lists its poller). Then it starts both workers.
+
+  So while the app or the relay runs, a CLI process takes none of their workflow tasks or activities. A write of the CLI waits for "accepted" first, so a long `watch.wait` starts no worker. The pollers of a CLI worker have an identity that ends in `@studio-cli`, and they do not count as another worker: the next command does not wait for the last one. At the shutdown (`plugin.shutdown`, the end of stdin, SIGINT or SIGTERM) the plugin stops its workers gracefully, so Temporal gives their work to another worker at once. If a CLI process ends abruptly (SIGKILL), a workflow that it ran goes back to the normal task queue after 1 second (its sticky timeout; the default is 5 seconds).
 
 The plugin knows no Spec Studio rule. The host applies its rules and stores the result. The plugin knows the relay's names only to choose a workflow.
 
@@ -161,7 +170,7 @@ Limits of one commit:
 
 ### Update every plugin-temporal of a deploy together
 
-The app's plugin and the relay's plugin are Temporal workers on the same task queue, `relay-<deploy_id>`. Each one can run a workflow task of any spec workflow. So they must run the same version of plugin-temporal. An older plugin-temporal (one with no `commit` update) on the same task queue:
+The app's plugin and the relay's plugin are Temporal workers on the same task queue, `relay-<deploy_id>` (and a `studio` CLI process, while the app and the relay are closed). Each one can run a workflow task of any spec workflow. So they must run the same version of plugin-temporal. An older plugin-temporal (one with no `commit` update) on the same task queue:
 
 - does not know the `commit` update. When it gets one, it rejects it: the commit writes nothing, and the caller gets `unavailable` with a text that says to update every plugin-temporal of the deploy.
 - cannot replay a history that has a `commit` update. Its workflow task fails, and Temporal gives the task again, maybe to the same worker. It has no `Deliver` activity, so that activity waits for a newer worker.

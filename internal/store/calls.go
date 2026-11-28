@@ -144,13 +144,26 @@ func (s *Store) update(ctx context.Context, t route.Target, name string, arg fun
 	}
 }
 
+// updateStage is the stage that the update call waits for. With no worker
+// of its own (host kind cli), the plugin waits for "accepted" with a
+// fallback timer (fallbackWorker), then for the result: an update that
+// waits long (watch.wait) is accepted at once, so it starts no worker.
+func (s *Store) updateStage(ctx context.Context, t route.Target) (client.WorkflowUpdateStage, func()) {
+	if s.needsWorker(t.TaskQueue) {
+		return client.WorkflowUpdateStageAccepted, s.fallbackWorker(ctx, t.TaskQueue)
+	}
+	return client.WorkflowUpdateStageCompleted, func() {}
+}
+
 func (s *Store) plainUpdate(ctx context.Context, t route.Target, name string, arg any, out any) error {
+	stage, accepted := s.updateStage(ctx, t)
 	h, err := s.clientFor(t).UpdateWorkflow(ctx, client.UpdateWorkflowOptions{
 		WorkflowID:   t.WorkflowID,
 		UpdateName:   name,
 		Args:         []any{arg},
-		WaitForStage: client.WorkflowUpdateStageCompleted,
+		WaitForStage: stage,
 	})
+	accepted()
 	if err != nil {
 		return err
 	}
@@ -172,15 +185,17 @@ func (s *Store) startUpdate(ctx context.Context, t route.Target, name string, ar
 		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 	}, workflows.EntityWorkflow, in)
+	stage, accepted := s.updateStage(ctx, t)
 	h, err := c.UpdateWithStartWorkflow(ctx, client.UpdateWithStartWorkflowOptions{
 		StartWorkflowOperation: op,
 		UpdateOptions: client.UpdateWorkflowOptions{
 			WorkflowID:   t.WorkflowID,
 			UpdateName:   name,
 			Args:         []any{arg},
-			WaitForStage: client.WorkflowUpdateStageCompleted,
+			WaitForStage: stage,
 		},
 	})
+	accepted()
 	if err != nil {
 		return err
 	}
@@ -200,7 +215,16 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 	}
 	delay := 50 * time.Millisecond
 	for {
+		answered := s.fallbackWorker(ctx, t.TaskQueue)
 		v, err := s.clientFor(t).QueryWorkflow(ctx, t.WorkflowID, "", name, args...)
+		answered()
+		if noPoller(err) && s.needsWorker(t.TaskQueue) {
+			// No worker polls the task queue: run this process's worker.
+			if err := s.startWorker(t.TaskQueue); err != nil {
+				return err
+			}
+			continue
+		}
 		if err == nil {
 			if err := v.Get(out); err != nil {
 				return unavailable(err)
