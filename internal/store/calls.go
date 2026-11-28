@@ -150,7 +150,7 @@ func (s *Store) update(ctx context.Context, t route.Target, name string, arg fun
 // waits long (watch.wait) is accepted at once, so it starts no worker.
 func (s *Store) updateStage(ctx context.Context, t route.Target) (client.WorkflowUpdateStage, func()) {
 	if s.needsWorker(t.TaskQueue) {
-		return client.WorkflowUpdateStageAccepted, s.fallbackWorker(ctx, t.TaskQueue)
+		return client.WorkflowUpdateStageAccepted, s.fallbackWorker(ctx, t.TaskQueue, false)
 	}
 	return client.WorkflowUpdateStageCompleted, func() {}
 }
@@ -215,7 +215,7 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 	}
 	delay := 50 * time.Millisecond
 	for {
-		answered := s.fallbackWorker(ctx, t.TaskQueue)
+		answered := s.fallbackWorker(ctx, t.TaskQueue, true)
 		v, err := s.clientFor(t).QueryWorkflow(ctx, t.WorkflowID, "", name, args...)
 		answered()
 		if noPoller(err) && s.needsWorker(t.TaskQueue) {
@@ -223,6 +223,16 @@ func (s *Store) query(ctx context.Context, t route.Target, name string, out any,
 			if err := s.startWorker(t.TaskQueue); err != nil {
 				return err
 			}
+		}
+		if noPoller(err) && s.lazy && s.justStarted(t.TaskQueue) {
+			// The new worker's pollers reach Temporal a moment later: try
+			// again, for at most noPollerRetry after the start.
+			select {
+			case <-ctx.Done():
+				return unavailable(ctx.Err())
+			case <-time.After(delay):
+			}
+			delay = min(delay*2, 500*time.Millisecond)
 			continue
 		}
 		if err == nil {

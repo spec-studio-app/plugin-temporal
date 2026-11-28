@@ -6,11 +6,15 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	taskqueuepb "go.temporal.io/api/taskqueue/v1"
+	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
@@ -30,9 +34,12 @@ import (
 //   - no other worker polled the task queue lately (the app and the relay
 //     are closed): then nobody else runs the workflows, and a call needs
 //     this worker; or
-//   - a call got no answer in workerWait (for example, the app closed a
-//     moment ago and Temporal still lists its poller). Then it starts both
-//     workers.
+//   - a call waits for a worker for workerWait, and Temporal shows that no
+//     other worker serves the task queue (no other poller polled since the
+//     call began, and the call's task waits in the task queue): for example,
+//     the app closed a moment ago and Temporal still lists its poller. Then
+//     it starts the worker of that task queue only. A slow app (a far
+//     region, a long replay) takes the task, so it does not count.
 //
 // The pollers of CLI workers have an identity that ends in cliIdentity. They
 // do not count as other workers: a CLI process lives for one command and
@@ -51,6 +58,26 @@ var (
 
 // cliIdentity ends the worker identity of the host kind cli.
 const cliIdentity = "@studio-cli"
+
+// cliStopTimeout is the WorkerStopTimeout of a CLI worker: at the shutdown,
+// an activity in progress (a catalog write, a delivery, a run export) gets
+// this long to end and report, so Temporal does not wait for its timeout
+// (1 to 2 minutes) before it gives the activity to another worker. The
+// plugin's shutdown has 5 s for the store's Close (plugin.shutdown's
+// default, the end of stdin and SIGINT/SIGTERM): 3 s for the stop, then at
+// most activityReport for a stopped activity to report, leaves time to close
+// the clients. A CLI process with no activity in progress stops at once.
+const cliStopTimeout = 3 * time.Second
+
+// activityReport is the longest wait, after the stop, for the activities
+// that the stop cancelled to report their end to Temporal.
+const activityReport = time.Second
+
+// noPollerRetry: after the plugin starts a worker, Temporal may still answer
+// "no poller seen" for a short time (the new pollers reach the server, and
+// each task queue partition, a moment later). A query then tries again for
+// this long.
+const noPollerRetry = 2 * time.Second
 
 // cliStickyTimeout: after an abrupt end of a CLI process, its workflows go
 // back to the normal task queue after this time (Temporal's default is 5 s).
@@ -124,6 +151,8 @@ func (s *Store) startWorker(tq string) error {
 	opts := worker.Options{}
 	if s.lazy {
 		opts.StickyScheduleToStartTimeout = cliStickyTimeout
+		opts.WorkerStopTimeout = cliStopTimeout
+		opts.Interceptors = []interceptor.WorkerInterceptor{&countActivities{n: &s.activities}}
 		host, _ := os.Hostname()
 		opts.Identity = fmt.Sprintf("%d@%s%s", os.Getpid(), host, cliIdentity)
 	}
@@ -136,6 +165,7 @@ func (s *Store) startWorker(tq string) error {
 		return protocol.NewError(protocol.Unavailable, "The plugin cannot start its Temporal worker on the task queue %s.", tq)
 	}
 	s.workers[tq] = w
+	s.started[tq] = time.Now()
 	if s.lazy && s.log != nil {
 		s.log.Info("worker started", "taskQueue", tq)
 	}
@@ -175,29 +205,125 @@ func (s *Store) needsWorker(tq string) bool {
 	return s.lazy && !s.hasWorker(tq)
 }
 
-// fallbackWorker starts the workers when the call to the task queue is not
-// done after workerWait. Call the returned function when the call is done.
-func (s *Store) fallbackWorker(ctx context.Context, tq string) func() {
+// fallbackWorker checks each workerWait, while the call to the task queue
+// is not done, whether another worker serves the task queue; when none
+// does, it starts this process's worker of that task queue. Call the
+// returned function when the call is done.
+//
+// A query is never in the backlog (Temporal gives it only to a poller that
+// waits), so for a query only a poller that polled again counts.
+func (s *Store) fallbackWorker(ctx context.Context, tq string, query bool) func() {
 	if !s.needsWorker(tq) {
 		return func() {}
 	}
+	since := time.Now()
 	done := make(chan struct{})
 	go func() {
-		t := time.NewTimer(workerWait)
+		t := time.NewTicker(workerWait)
 		defer t.Stop()
-		select {
-		case <-done:
-		case <-ctx.Done():
-		case <-t.C:
-			for _, q := range []string{tq, s.set.TaskQueue, s.set.ConfigTaskQueue} {
-				if err := s.startWorker(q); err != nil && s.log != nil {
-					s.log.Warn("cannot start the worker", "taskQueue", q, "error", err.Error())
-				}
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
 			}
+			if !s.needsWorker(tq) || s.otherWorkerServes(ctx, tq, since, query) {
+				continue
+			}
+			if err := s.startWorker(tq); err != nil && s.log != nil {
+				s.log.Warn("cannot start the worker", "taskQueue", tq, "error", err.Error())
+			}
+			return
 		}
 	}()
 	var once sync.Once
 	return func() { once.Do(func() { close(done) }) }
+}
+
+// otherWorkerServes is true when another worker (not a CLI worker) serves
+// the task queue of a call that began at since: one of its pollers polled
+// again after since (it took a task, maybe this call's), or it polled
+// lately and no workflow task waits in the task queue for more than
+// workerWait (so the call's task went to a worker; not for a query). When
+// Temporal does not answer, it is false.
+func (s *Store) otherWorkerServes(ctx context.Context, tq string, since time.Time, query bool) bool {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := s.data.WorkflowService().DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
+		Namespace:     s.set.Namespace,
+		TaskQueue:     &taskqueuepb.TaskQueue{Name: tq, Kind: enumspb.TASK_QUEUE_KIND_NORMAL},
+		TaskQueueType: enumspb.TASK_QUEUE_TYPE_WORKFLOW,
+		ReportStats:   true,
+	})
+	if err != nil {
+		return false
+	}
+	fresh := false
+	for _, p := range resp.GetPollers() {
+		at := p.GetLastAccessTime()
+		if at == nil || strings.HasSuffix(p.GetIdentity(), cliIdentity) {
+			continue
+		}
+		if at.AsTime().After(since) {
+			return true
+		}
+		if time.Since(at.AsTime()) < pollerFresh {
+			fresh = true
+		}
+	}
+	if !fresh || query {
+		return false
+	}
+	st := resp.GetStats()
+	if st == nil {
+		// No backlog figure: count the fresh poller.
+		return true
+	}
+	return st.GetApproximateBacklogCount() == 0 || st.GetApproximateBacklogAge().AsDuration() < workerWait
+}
+
+// justStarted is true when this process started the worker of the task
+// queue less than noPollerRetry ago.
+func (s *Store) justStarted(tq string) bool {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	at, ok := s.started[tq]
+	return ok && time.Since(at) < noPollerRetry
+}
+
+// awaitActivities waits, at most activityReport, until no activity of this
+// process runs: the stop cancelled them, and each reports its end to
+// Temporal (so Temporal retries it at once) before the clients close.
+func (s *Store) awaitActivities() {
+	deadline := time.Now().Add(activityReport)
+	for s.activities.Load() > 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The report follows the activity's end in the same goroutine.
+	time.Sleep(100 * time.Millisecond)
+}
+
+// countActivities counts the activities in progress.
+type countActivities struct {
+	interceptor.WorkerInterceptorBase
+	n *atomic.Int64
+}
+
+func (c *countActivities) InterceptActivity(ctx context.Context, next interceptor.ActivityInboundInterceptor) interceptor.ActivityInboundInterceptor {
+	return &countActivity{ActivityInboundInterceptorBase: interceptor.ActivityInboundInterceptorBase{Next: next}, n: c.n}
+}
+
+type countActivity struct {
+	interceptor.ActivityInboundInterceptorBase
+	n *atomic.Int64
+}
+
+func (a *countActivity) ExecuteActivity(ctx context.Context, in *interceptor.ExecuteActivityInput) (any, error) {
+	a.n.Add(1)
+	defer a.n.Add(-1)
+	return a.Next.ExecuteActivity(ctx, in)
 }
 
 // noPoller is Temporal's answer to a query when no worker polled the task

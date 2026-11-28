@@ -139,7 +139,31 @@ func TestCLIAfterAppClosedStartsWorker(t *testing.T) {
 	if d := time.Since(start); d > workerWait+4*time.Second {
 		t.Fatalf("the CLI took %v", d)
 	}
-	if workerCount(cli) == 0 {
-		t.Fatal("the CLI started no worker")
+	// The safety net starts only the worker of the call's task queue.
+	if !cli.hasWorker(cli.set.TaskQueue) || cli.hasWorker(cli.set.ConfigTaskQueue) {
+		t.Fatalf("the CLI runs the workers %v, want only %s", cli.workerQueues(), cli.set.TaskQueue)
+	}
+}
+
+// A slow call next to a live app: the safety net checks again and starts
+// no worker, because the app's worker serves the task queue.
+func TestCLISlowCallNextToAppStartsNoWorker(t *testing.T) {
+	e := newEnv(t)
+	app := e.openKind(protocol.HostApp)
+	put(t, app, "specs", "1a2b3c4d5e6f:fix-login", map[string]string{"text": "app"}, nil, nil)
+	cli := e.openKind(protocol.HostCLI)
+	tq := cli.set.TaskQueue
+	if !cli.otherWorkerServes(ctx(t), tq, time.Now(), false) {
+		t.Fatal("the app's worker does not count as serving the task queue")
+	}
+	// A call that takes 3 workerWaits.
+	answered := cli.fallbackWorker(ctx(t), tq, false)
+	time.Sleep(3*workerWait + 200*time.Millisecond)
+	answered()
+	if n := workerCount(cli); n != 0 {
+		t.Fatalf("a slow call next to the app started %d workers, want 0", n)
+	}
+	if got := getText(t, cli, "specs", "1a2b3c4d5e6f:fix-login"); got != "app" {
+		t.Fatalf("read %q", got)
 	}
 }

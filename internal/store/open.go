@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
@@ -64,11 +65,15 @@ type Store struct {
 	// lazy is true for the host kind cli: the workers start only when
 	// needed (startWorker).
 	lazy bool
-	// wmu guards workers and closed.
+	// wmu guards workers, started and closed.
 	wmu sync.Mutex
 	// workers are the running workers, by task queue.
 	workers map[string]worker.Worker
+	// started is the time that each worker started.
+	started map[string]time.Time
 	closed  bool
+	// activities counts the activities in progress in this process's workers.
+	activities atomic.Int64
 }
 
 // New makes a store. Open connects it, and reads the options then (after the
@@ -172,6 +177,7 @@ func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
 	s.lazy = o.Host.Kind == protocol.HostCLI
 	s.wmu.Lock()
 	s.workers = map[string]worker.Worker{}
+	s.started = map[string]time.Time{}
 	s.closed = false
 	s.wmu.Unlock()
 	if err := s.openWorkers(dialCtx); err != nil {
@@ -266,17 +272,28 @@ func (s *Store) openBlobs(ctx context.Context) error {
 	return nil
 }
 
-// stopWorkers stops the workers. Stop is graceful: it tells Temporal that
-// the worker stops, so Temporal gives its sticky workflows and its
-// activities to another worker at once. No worker starts after it.
+// stopWorkers stops the workers, all at once. Stop is graceful: it tells
+// Temporal that the worker stops, so Temporal gives its sticky workflows to
+// another worker at once, and it lets the activities in progress end
+// (WorkerStopTimeout). No worker starts after it.
 func (s *Store) stopWorkers() {
 	s.wmu.Lock()
 	ws := s.workers
 	s.workers = nil
 	s.closed = true
 	s.wmu.Unlock()
+	busy := s.activities.Load() > 0
+	var wg sync.WaitGroup
 	for _, w := range ws {
-		w.Stop()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.Stop()
+		}()
+	}
+	wg.Wait()
+	if busy {
+		s.awaitActivities()
 	}
 }
 
