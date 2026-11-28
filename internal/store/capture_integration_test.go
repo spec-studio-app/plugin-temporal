@@ -14,6 +14,8 @@ import (
 	"go.temporal.io/api/temporalproto"
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
+
+	"github.com/spec-studio-app/plugin-temporal/internal/workflows"
 )
 
 // TestCaptureHistories writes the histories of the replay tests to
@@ -30,7 +32,7 @@ func TestCaptureHistories(t *testing.T) {
 	if prefix == "" {
 		t.Fatal("CAPTURE_NAME is not set (for example v2)")
 	}
-	for _, n := range []string{"entity-run1", "entity-run2", "catalog-specs"} {
+	for _, n := range []string{"entity-run1", "entity-run2", "catalog-specs", "entity-commit-remote"} {
 		if _, err := os.Stat(filepath.Join("../workflows/testdata/histories", prefix+"-"+n+".json")); err == nil {
 			t.Fatalf("the histories %s-* exist already: choose a new CAPTURE_NAME", prefix)
 		}
@@ -54,7 +56,22 @@ func TestCaptureHistories(t *testing.T) {
 		t.Fatalf("stale put: %v", err)
 	}
 	v2 := put(t, s, "specs", key, map[string]any{"n": 2}, map[string]any{"open": false}, &v1).Version
-	put(t, s, "app-specs", key, map[string]any{"stage": "build"}, nil, nil)
+	// state.commit: a spec's document and its activity in one update; a
+	// stale commit; a commit with no events.
+	c1, err := s.Commit(ctx(t), protocol.StateCommitParams{Collection: "app-specs", Key: key, Value: []byte(`{"stage":"plan"}`), Stream: stream, Events: []protocol.NewEvent{{Type: "activity", Data: []byte(`{"kind":"stage"}`)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Commit(ctx(t), protocol.StateCommitParams{Collection: "app-specs", Key: key, Value: []byte(`{}`), ExpectedVersion: &stale, Stream: stream, Events: []protocol.NewEvent{{Type: "activity", Data: []byte(`{}`)}}}); !protocol.Is(err, protocol.Conflict) {
+		t.Fatalf("stale commit: %v", err)
+	}
+	if _, err := s.Commit(ctx(t), protocol.StateCommitParams{Collection: "app-specs", Key: key, Value: []byte(`{"stage":"build"}`), ExpectedVersion: &c1.Version, Stream: stream, Events: []protocol.NewEvent{}}); err != nil {
+		t.Fatal(err)
+	}
+	// A commit of a document and a stream with two workflows (Deliver).
+	if _, err := s.Commit(ctx(t), protocol.StateCommitParams{Collection: "notes", Key: "a", Value: []byte(`1`), Stream: "notes-log", Events: []protocol.NewEvent{{Type: "note", Data: []byte(`{}`)}}}); err != nil {
+		t.Fatal(err)
+	}
 	cur := appendEvents(t, s, stream, "sync", "message")
 	c, cancel := ctxWithTimeout(700 * time.Millisecond)
 	_, _ = s.Wait(c, protocol.WatchWaitParams{Stream: stream, After: &cur[1], TimeoutMs: 700})
@@ -79,16 +96,21 @@ func TestCaptureHistories(t *testing.T) {
 	save(t, prefix+"-entity-run1.json", wf, historyOf(t, rc, wf, firstRun))
 	save(t, prefix+"-entity-run2.json", wf, historyOf(t, rc, wf, ""))
 	save(t, prefix+"-catalog-specs.json", "catalog/"+deploy+"/specs", historyOf(t, rc, "catalog/"+deploy+"/specs", ""))
+	notes := s.router.Doc("notes", "a").WorkflowID
+	save(t, prefix+"-entity-commit-remote.json", notes, historyOf(t, rc, notes, ""))
 }
 
 // save writes a history, and its workflow ID next to it (<name>.id): the
 // workflows check their input against their workflow ID, so the replay needs it.
+// The repo is public: save replaces the worker identities and the sticky task
+// queue names, which hold this computer's name (workflows.ScrubHistory).
 func save(t *testing.T, name, workflowID string, events []*historypb.HistoryEvent) {
 	t.Helper()
 	b, err := temporalproto.CustomJSONMarshalOptions{Indent: " "}.Marshal(&historypb.History{Events: events})
 	if err != nil {
 		t.Fatal(err)
 	}
+	b = workflows.ScrubHistory(b)
 	var check map[string]any
 	if err := json.Unmarshal(b, &check); err != nil {
 		t.Fatal(err)

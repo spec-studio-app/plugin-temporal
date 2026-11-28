@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/minio/minio-go/v7 v7.4.1
-	github.com/spec-studio-app/plugin-sdk/go v0.0.0-20261127140337-394b06fac3b9
+	github.com/spec-studio-app/plugin-sdk/go v0.0.0-20261127193412-ed507a40b3c5
 	go.temporal.io/api v1.64.3
 	go.temporal.io/sdk v1.52.0
 	google.golang.org/protobuf v1.36.12

@@ -22,6 +22,8 @@ type harness struct {
 	// exports counts the ExportRun calls.
 	exports     []ExportInput
 	catalogPuts int
+	// catalogErr, when set, gives the error of a catalog put.
+	catalogErr func(CatalogPutInput) error
 }
 
 func newHarness(t *testing.T) *harness {
@@ -30,6 +32,11 @@ func newHarness(t *testing.T) *harness {
 	h.env.RegisterWorkflowWithOptions(Entity, workflow.RegisterOptions{Name: EntityWorkflow})
 	h.env.SetStartWorkflowOptions(client.StartWorkflowOptions{ID: wfID})
 	h.env.RegisterActivityWithOptions(func(ctx context.Context, in CatalogPutInput) error {
+		if h.catalogErr != nil {
+			if err := h.catalogErr(in); err != nil {
+				return err
+			}
+		}
 		h.catalogPuts++
 		return nil
 	}, activity.RegisterOptions{Name: ActivityCatalogPut})

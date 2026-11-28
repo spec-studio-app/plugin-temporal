@@ -7,6 +7,7 @@ import (
 
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
 
+	"github.com/spec-studio-app/plugin-temporal/internal/history"
 	"github.com/spec-studio-app/plugin-temporal/internal/workflows"
 )
 
@@ -150,4 +151,66 @@ func (s *Store) List(ctx context.Context, p protocol.StateListParams) (protocol.
 		out.Cursor = &next
 	}
 	return out, nil
+}
+
+// Commit is state.commit: one commit update on the document's workflow. The
+// update checks the expected version, writes the document and appends the
+// events. A stale version gets conflict, and the update changes nothing.
+//
+// A spec's document (app-specs, specs or closed-specs, key
+// "<repoKey>:<slug>") and its stream "spec:<repoKey>:<slug>" have the same
+// workflow (see the route package). Then the document and the events change
+// in one workflow task, and the history holds both or neither. For a
+// document and a stream with two workflows, the update sends the events to
+// the stream's workflow first, and writes the document only after the
+// delivery, so a failed commit writes nothing (see the commit update in the
+// workflows package).
+func (s *Store) Commit(ctx context.Context, p protocol.StateCommitParams) (protocol.StateCommitResult, error) {
+	t := s.router.Doc(p.Collection, p.Key)
+	st := s.router.Stream(p.Stream)
+	if len(p.Events) > 0 && st.WorkflowID != t.WorkflowID && st.Scope != t.Scope {
+		// The two workflows have different payload keys: the document's
+		// worker cannot write to the stream's workflow.
+		return protocol.StateCommitResult{}, protocol.NewError(protocol.Refused, "The plugin cannot commit a document of the collection %s with events: the document and the stream use different payload keys.", p.Collection)
+	}
+	evs := make([]workflows.NewEvent, len(p.Events))
+	for i, e := range p.Events {
+		evs[i] = workflows.NewEvent{Type: e.Type, Data: e.Data, At: e.At}
+	}
+	var res workflows.CommitResult
+	arg := func() any {
+		return workflows.CommitInput{
+			Bound: bound(t), Collection: p.Collection, Key: p.Key, Value: p.Value, Attributes: p.Attributes, Expected: p.ExpectedVersion,
+			Stream: p.Stream, Events: evs, StreamTarget: st.WorkflowID, StreamQueue: st.TaskQueue,
+		}
+	}
+	if err := s.update(ctx, t, workflows.UpdateCommit, arg, &res, true); err != nil {
+		return protocol.StateCommitResult{}, err
+	}
+	out := protocol.StateCommitResult{Version: res.Version, UpdatedAt: res.UpdatedAt, Cursors: make([]string, len(res.Seqs))}
+	for i, seq := range res.Seqs {
+		out.Cursors[i] = history.Cursor(res.Nonce, seq)
+	}
+	return out, nil
+}
+
+// StoreID is the storeId of the handshake:
+// "temporal:<namespace>/<namespace ID>/<deploy ID>". The namespace and the
+// deploy ID name the workflows; the namespace ID (from DescribeNamespace)
+// tells two servers apart that each have a namespace with the same name
+// (for example "default" on two dev servers). The address is not part of
+// it: one namespace has many addresses (the namespace endpoint and the
+// regional endpoint of Temporal Cloud, a cluster service name and a public
+// host, localhost and 127.0.0.1), and two processes on one deploy must
+// give the same value.
+func (s *Store) StoreID() string {
+	if s.set == nil {
+		return ""
+	}
+	id := s.namespaceID
+	if id == "" {
+		// A server that gives no ID: the name is the best that the plugin has.
+		id = s.set.Namespace
+	}
+	return "temporal:" + s.set.Namespace + "/" + id + "/" + s.set.DeployID
 }

@@ -25,7 +25,8 @@ func buildPlugin(t *testing.T) string {
 	return bin
 }
 
-// R1.S1: describe before the handshake.
+// R1.S1: describe before the handshake. The plugin speaks 1.0 and 1.1
+// (state.commit).
 func TestDescribe(t *testing.T) {
 	bin := buildPlugin(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -42,7 +43,7 @@ func TestDescribe(t *testing.T) {
 	if d.Plugin.Name != "plugin-temporal" || d.Plugin.Repo != "https://github.com/spec-studio-app/plugin-temporal" || d.Plugin.Version == "" {
 		t.Fatalf("info: %+v", d.Plugin)
 	}
-	if len(d.ProtocolVersions) != 1 || d.ProtocolVersions[0] != "1.0" || !d.Durable {
+	if len(d.ProtocolVersions) != 2 || d.ProtocolVersions[0] != "1.0" || d.ProtocolVersions[1] != "1.1" || !d.Durable {
 		t.Fatalf("versions %v durable %v", d.ProtocolVersions, d.Durable)
 	}
 	caps := map[protocol.Capability]bool{}

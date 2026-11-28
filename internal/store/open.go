@@ -1,6 +1,11 @@
 // Package store is the plugin.Store of plugin-temporal. The plugin process is
 // a Temporal client and a Temporal worker: it runs the workflows that hold
 // the data, on the data task queue and on the config task queue.
+//
+// The plugin of the studio CLI (host kind cli) lives for one command. It
+// starts a worker on a task queue only when no other worker polls it (the
+// app or the relay is closed), or when a call gets no answer in time. So it
+// does not take the work of the app's or the relay's workflows.
 package store
 
 import (
@@ -11,6 +16,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.temporal.io/api/serviceerror"
@@ -19,17 +25,14 @@ import (
 	"go.temporal.io/sdk/converter"
 	tlog "go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/worker"
-	"go.temporal.io/sdk/workflow"
 
 	"github.com/spec-studio-app/plugin-sdk/go/plugin"
 	"github.com/spec-studio-app/plugin-sdk/go/protocol"
 
-	"github.com/spec-studio-app/plugin-temporal/internal/activities"
 	"github.com/spec-studio-app/plugin-temporal/internal/blobstore"
 	"github.com/spec-studio-app/plugin-temporal/internal/codec"
 	"github.com/spec-studio-app/plugin-temporal/internal/route"
 	"github.com/spec-studio-app/plugin-temporal/internal/settings"
-	"github.com/spec-studio-app/plugin-temporal/internal/workflows"
 )
 
 // Options are the test-only knobs of the main flags. They go into the start
@@ -53,8 +56,21 @@ type Store struct {
 	dataDC   converter.DataConverter
 	configDC converter.DataConverter
 	blobs    blobstore.Store
-	workers  []worker.Worker
-	log      *slog.Logger
+	// namespaceID is the ID of the namespace (from DescribeNamespace), for
+	// the storeId.
+	namespaceID string
+	log         *slog.Logger
+
+	// lazy is true for the host kind cli: the workers start only when
+	// needed (startWorker).
+	lazy bool
+	// wmu guards workers, started and closed.
+	wmu sync.Mutex
+	// workers are the running workers, by task queue.
+	workers map[string]worker.Worker
+	// started is the time that each worker started.
+	started map[string]time.Time
+	closed  bool
 }
 
 // New makes a store. Open connects it, and reads the options then (after the
@@ -68,6 +84,8 @@ var (
 	_ plugin.Watcher         = (*Store)(nil)
 	_ plugin.StreamContinuer = (*Store)(nil)
 	_ plugin.Durable         = (*Store)(nil)
+	_ plugin.Committer       = (*Store)(nil)
+	_ plugin.StoreIdentity   = (*Store)(nil)
 )
 
 // Durable is true: Temporal and the blob store keep the data.
@@ -153,31 +171,26 @@ func (s *Store) Open(ctx context.Context, o plugin.OpenOptions) error {
 		return err
 	}
 
-	for _, wk := range []struct {
-		c  client.Client
-		tq string
-		dc converter.DataConverter
-	}{{s.data, set.TaskQueue, s.dataDC}, {s.config, set.ConfigTaskQueue, s.configDC}} {
-		w := worker.New(wk.c, wk.tq, worker.Options{})
-		w.RegisterWorkflowWithOptions(workflows.Entity, workflow.RegisterOptions{Name: workflows.EntityWorkflow})
-		w.RegisterWorkflowWithOptions(workflows.Catalog, workflow.RegisterOptions{Name: workflows.CatalogWorkflow})
-		a := &activities.Activities{Client: wk.c, DC: wk.dc, Blobs: s.blobs, Router: s.router, CatalogRunLimit: s.opts.CatalogRunLimit, InlineBytes: s.opts.InlineBytes}
-		a.Register(w)
-		if err := w.Start(); err != nil {
-			s.stopWorkers()
-			s.closeClients()
-			return protocol.NewError(protocol.Unavailable, "The plugin cannot start its Temporal worker on the task queue %s.", wk.tq)
-		}
-		s.workers = append(s.workers, w)
+	s.lazy = o.Host.Kind == protocol.HostCLI
+	s.wmu.Lock()
+	s.workers = map[string]worker.Worker{}
+	s.started = map[string]time.Time{}
+	s.closed = false
+	s.wmu.Unlock()
+	if err := s.openWorkers(dialCtx); err != nil {
+		s.stopWorkers()
+		s.closeClients()
+		return err
 	}
-	o.Log.Info("open", "settings", set.String(), "blobs", s.blobs.Where())
+	o.Log.Info("open", "settings", set.String(), "blobs", s.blobs.Where(), "workers", s.workerQueues())
 	return nil
 }
 
 // checkServer checks the namespace and the server version.
 func (s *Store) checkServer(ctx context.Context) error {
 	svc := s.data.WorkflowService()
-	if _, err := svc.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: s.set.Namespace}); err != nil {
+	ns, err := svc.DescribeNamespace(ctx, &workflowservice.DescribeNamespaceRequest{Namespace: s.set.Namespace})
+	if err != nil {
 		var nf *serviceerror.NamespaceNotFound
 		var nf2 *serviceerror.NotFound
 		if errors.As(err, &nf) || errors.As(err, &nf2) {
@@ -189,6 +202,7 @@ func (s *Store) checkServer(ctx context.Context) error {
 		}
 		return protocol.NewError(protocol.Unavailable, unreachable)
 	}
+	s.namespaceID = ns.GetNamespaceInfo().GetId()
 	info, err := svc.GetSystemInfo(ctx, &workflowservice.GetSystemInfoRequest{})
 	if err == nil && info.GetServerVersion() != "" && versionLess(info.GetServerVersion(), minServer) {
 		return protocol.NewError(protocol.Unavailable, "The Temporal server is version %s. The plugin needs %s or later (update-with-start). Update the server, or use Temporal Cloud.", info.GetServerVersion(), minServer)
@@ -255,11 +269,26 @@ func (s *Store) openBlobs(ctx context.Context) error {
 	return nil
 }
 
+// stopWorkers stops the workers, all at once, and returns when they
+// stopped. Stop is graceful: it tells Temporal that the worker stops, so
+// Temporal gives its sticky workflows to another worker at once, and it
+// waits for the activities in progress to end and report (WorkerStopTimeout).
+// No worker starts after it.
 func (s *Store) stopWorkers() {
-	for _, w := range s.workers {
-		w.Stop()
-	}
+	s.wmu.Lock()
+	ws := s.workers
 	s.workers = nil
+	s.closed = true
+	s.wmu.Unlock()
+	var wg sync.WaitGroup
+	for _, w := range ws {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.Stop()
+		}()
+	}
+	wg.Wait()
 }
 
 func (s *Store) closeClients() {

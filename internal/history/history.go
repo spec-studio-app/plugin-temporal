@@ -1,9 +1,10 @@
 // Package history reads the protocol events of a run from its workflow
 // history: from Temporal, or from the run's export in the blob store.
 //
-// An event is an accepted append update whose completion succeeded. The
-// update's input holds the events; its result holds their sequence numbers
-// and times.
+// An event is an accepted append or commit update whose completion
+// succeeded. The update's input holds the events; its result holds their
+// sequence numbers and times. A commit whose events went to the workflow of
+// another stream (its result is Remote) has no event in this history.
 package history
 
 import (
@@ -38,24 +39,34 @@ type Event struct {
 
 // FromHistory finds the events of one stream in a run's history events.
 func FromHistory(events []*historypb.HistoryEvent, dc converter.DataConverter, stream string) ([]Event, error) {
-	inputs := map[string]workflows.AppendInput{}
+	inputs := map[string]pending{}
 	var out []Event
 	for _, ev := range events {
 		switch ev.GetEventType() {
 		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED:
 			a := ev.GetWorkflowExecutionUpdateAcceptedEventAttributes()
 			req := a.GetAcceptedRequest()
-			if req.GetInput().GetName() != workflows.UpdateAppend {
+			var p pending
+			switch name := req.GetInput().GetName(); name {
+			case workflows.UpdateAppend:
+				var in workflows.AppendInput
+				if err := dc.FromPayloads(req.GetInput().GetArgs(), &in); err != nil {
+					return nil, fmt.Errorf("cannot read the append update of event %d: %w", ev.GetEventId(), err)
+				}
+				p = pending{stream: in.Stream, events: in.Events}
+			case workflows.UpdateCommit:
+				var in workflows.CommitInput
+				if err := dc.FromPayloads(req.GetInput().GetArgs(), &in); err != nil {
+					return nil, fmt.Errorf("cannot read the commit update of event %d: %w", ev.GetEventId(), err)
+				}
+				p = pending{stream: in.Stream, events: in.Events, commit: true}
+			default:
 				continue
 			}
-			var in workflows.AppendInput
-			if err := dc.FromPayloads(req.GetInput().GetArgs(), &in); err != nil {
-				return nil, fmt.Errorf("cannot read the append update of event %d: %w", ev.GetEventId(), err)
-			}
-			if in.Stream != stream {
+			if p.stream != stream || len(p.events) == 0 {
 				continue
 			}
-			inputs[req.GetMeta().GetUpdateId()] = in
+			inputs[req.GetMeta().GetUpdateId()] = p
 		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_COMPLETED:
 			a := ev.GetWorkflowExecutionUpdateCompletedEventAttributes()
 			in, ok := inputs[a.GetMeta().GetUpdateId()]
@@ -67,24 +78,45 @@ func FromHistory(events []*historypb.HistoryEvent, dc converter.DataConverter, s
 			if success == nil {
 				continue
 			}
-			var res workflows.AppendResult
-			if err := dc.FromPayloads(success, &res); err != nil {
-				return nil, fmt.Errorf("cannot read the append result of event %d: %w", ev.GetEventId(), err)
+			var seqs []int64
+			var ats []time.Time
+			if in.commit {
+				var res workflows.CommitResult
+				if err := dc.FromPayloads(success, &res); err != nil {
+					return nil, fmt.Errorf("cannot read the commit result of event %d: %w", ev.GetEventId(), err)
+				}
+				if res.Remote {
+					continue
+				}
+				seqs, ats = res.Seqs, res.Ats
+			} else {
+				var res workflows.AppendResult
+				if err := dc.FromPayloads(success, &res); err != nil {
+					return nil, fmt.Errorf("cannot read the append result of event %d: %w", ev.GetEventId(), err)
+				}
+				seqs, ats = res.Seqs, res.Ats
 			}
-			if len(res.Seqs) != len(in.Events) || len(res.Ats) != len(in.Events) {
-				return nil, fmt.Errorf("the append update of event %d has %d events and %d sequence numbers", ev.GetEventId(), len(in.Events), len(res.Seqs))
+			if len(seqs) != len(in.events) || len(ats) != len(in.events) {
+				return nil, fmt.Errorf("the update of event %d has %d events and %d sequence numbers", ev.GetEventId(), len(in.events), len(seqs))
 			}
-			for i, e := range in.Events {
+			for i, e := range in.events {
 				data := e.Data
 				if len(data) == 0 {
 					data = json.RawMessage("null")
 				}
-				out = append(out, Event{Seq: res.Seqs[i], Type: e.Type, At: res.Ats[i].UTC(), Data: data})
+				out = append(out, Event{Seq: seqs[i], Type: e.Type, At: ats[i].UTC(), Data: data})
 			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
 	return out, nil
+}
+
+// pending is an accepted update with events, until its completion.
+type pending struct {
+	stream string
+	events []workflows.NewEvent
+	commit bool
 }
 
 // FromTemporal reads the history of a run from Temporal. It returns the

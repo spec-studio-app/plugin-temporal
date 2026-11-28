@@ -39,6 +39,11 @@ type entity struct {
 	closing bool
 	// force is set by the continue update (the test hook).
 	force bool
+	// writing holds the documents (docKey) of the commits that run. A
+	// commit holds its document from its version check to its end, so no
+	// other write of the document comes between the check and the write.
+	// Every path of the commit handler releases it (defer).
+	writing map[string]bool
 }
 
 func docKey(collection, key string) string { return collection + "\x00" + key }
@@ -136,22 +141,92 @@ func exportCtx(ctx workflow.Context) workflow.Context {
 // write stores a document with the next write number and puts it in the
 // collection's catalog.
 func (e *entity) write(ctx workflow.Context, collection, key string, value json.RawMessage, attrs map[string]any) (*Doc, error) {
+	e.chain.N++
+	d := e.newDoc(ctx, collection, key, value, attrs, e.chain.N)
+	e.docs[docKey(collection, key)] = d
+	return d, e.catalogPut(ctx, d)
+}
+
+// newDoc makes the document of write number n. It does not store it.
+func (e *entity) newDoc(ctx workflow.Context, collection, key string, value json.RawMessage, attrs map[string]any, n int64) *Doc {
 	if attrs == nil {
 		attrs = map[string]any{}
 	}
-	e.chain.N++
-	d := &Doc{Collection: collection, Key: key, Value: value, Attributes: attrs, Version: e.version(e.chain.N), N: e.chain.N, UpdatedAt: workflow.Now(ctx).UTC()}
-	e.docs[docKey(collection, key)] = d
-	entry := CatalogEntry{Attributes: attrs, Version: d.Version, N: d.N, UpdatedAt: d.UpdatedAt}
-	err := workflow.ExecuteActivity(catalogCtx(ctx), ActivityCatalogPut, CatalogPutInput{Collection: collection, Key: key, Entry: entry}).Get(ctx, nil)
-	return d, err
+	return &Doc{Collection: collection, Key: key, Value: value, Attributes: attrs, Version: e.version(n), N: n, UpdatedAt: workflow.Now(ctx).UTC()}
+}
+
+// catalogPut puts the document's entry in the collection's catalog.
+func (e *entity) catalogPut(ctx workflow.Context, d *Doc) error {
+	entry := CatalogEntry{Attributes: d.Attributes, Version: d.Version, N: d.N, UpdatedAt: d.UpdatedAt}
+	return workflow.ExecuteActivity(catalogCtx(ctx), ActivityCatalogPut, CatalogPutInput{Collection: d.Collection, Key: d.Key, Entry: entry}).Get(ctx, nil)
+}
+
+// awaitDoc waits until no commit of the document runs. It returns at once
+// (with no command) when none runs.
+func (e *entity) awaitDoc(ctx workflow.Context, collection, key string) error {
+	k := docKey(collection, key)
+	return workflow.Await(ctx, func() bool { return !e.writing[k] })
+}
+
+// appendEvents gives the next sequence numbers to the events of the stream.
+// It does not wait, so the caller's other changes go into the same
+// workflow task.
+func (e *entity) appendEvents(ctx workflow.Context, stream string, events []NewEvent) (seqs []int64, ats []time.Time) {
+	now := workflow.Now(ctx).UTC()
+	for _, ev := range events {
+		at := now
+		if ev.At != nil {
+			at = ev.At.UTC()
+		}
+		seqs = append(seqs, e.chain.NextSeq)
+		ats = append(ats, at)
+		e.chain.NextSeq++
+		if e.minAt == nil || at.Before(*e.minAt) {
+			t := at
+			e.minAt = &t
+		}
+		if e.maxAt == nil || at.After(*e.maxAt) {
+			t := at
+			e.maxAt = &t
+		}
+	}
+	e.chain.Stream = stream
+	return seqs, ats
+}
+
+// delivered finds a delivery that the chain has already.
+func (e *entity) delivered(id string) *Delivery {
+	if id == "" {
+		return nil
+	}
+	for i := range e.chain.Deliveries {
+		if e.chain.Deliveries[i].ID == id {
+			d := e.chain.Deliveries[i]
+			return &d
+		}
+	}
+	return nil
+}
+
+func (e *entity) checkStream(stream string) error {
+	if e.chain.Stream != "" && e.chain.Stream != stream {
+		return temporal.NewNonRetryableApplicationError("The stream is not the stream of this workflow.", ErrBadInput, nil)
+	}
+	return nil
+}
+
+func deliverCtx(ctx workflow.Context) workflow.Context {
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		RetryPolicy:         &temporal.RetryPolicy{InitialInterval: 200 * time.Millisecond, BackoffCoefficient: 2, MaximumInterval: 30 * time.Second},
+	})
 }
 
 // Entity is the entity workflow.
 func Entity(ctx workflow.Context, in EntityInput) error {
 	info := workflow.GetInfo(ctx)
 	log := workflow.GetLogger(ctx)
-	e := &entity{wfID: info.WorkflowExecution.ID, runID: info.WorkflowExecution.RunID, docs: map[string]*Doc{}}
+	e := &entity{wfID: info.WorkflowExecution.ID, runID: info.WorkflowExecution.RunID, docs: map[string]*Doc{}, writing: map[string]bool{}}
 
 	// A handoff input copied from another workflow: end at once, as the
 	// relay's workflows do.
@@ -319,6 +394,9 @@ func (e *entity) handlers(ctx workflow.Context) error {
 	}
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdatePut,
 		func(ctx workflow.Context, in PutInput) (PutResult, error) {
+			if err := e.awaitDoc(ctx, in.Collection, in.Key); err != nil {
+				return PutResult{}, err
+			}
 			if err := putCheck(in); err != nil {
 				return PutResult{}, err
 			}
@@ -351,6 +429,9 @@ func (e *entity) handlers(ctx workflow.Context) error {
 	}
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateDelete,
 		func(ctx workflow.Context, in DeleteInput) (bool, error) {
+			if err := e.awaitDoc(ctx, in.Collection, in.Key); err != nil {
+				return false, err
+			}
 			if err := delCheck(in); err != nil {
 				return false, err
 			}
@@ -377,28 +458,18 @@ func (e *entity) handlers(ctx workflow.Context) error {
 	// the history: they are the event log.
 	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateAppend,
 		func(ctx workflow.Context, in AppendInput) (AppendResult, error) {
+			if d := e.delivered(in.Delivery); d != nil {
+				return AppendResult{}, e.deliveredErr(*d)
+			}
 			e.touch()
-			now := workflow.Now(ctx).UTC()
 			res := AppendResult{Nonce: e.chain.Nonce}
-			for _, ev := range in.Events {
-				at := now
-				if ev.At != nil {
-					at = ev.At.UTC()
-				}
-				seq := e.chain.NextSeq
-				e.chain.NextSeq++
-				res.Seqs = append(res.Seqs, seq)
-				res.Ats = append(res.Ats, at)
-				if e.minAt == nil || at.Before(*e.minAt) {
-					t := at
-					e.minAt = &t
-				}
-				if e.maxAt == nil || at.After(*e.maxAt) {
-					t := at
-					e.maxAt = &t
+			res.Seqs, res.Ats = e.appendEvents(ctx, in.Stream, in.Events)
+			if in.Delivery != "" {
+				e.chain.Deliveries = append(e.chain.Deliveries, Delivery{ID: in.Delivery, FirstSeq: res.Seqs[0], Count: len(res.Seqs)})
+				if n := len(e.chain.Deliveries); n > MaxDeliveries {
+					e.chain.Deliveries = append([]Delivery(nil), e.chain.Deliveries[n-MaxDeliveries:]...)
 				}
 			}
-			e.chain.Stream = in.Stream
 			return res, nil
 		},
 		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, in AppendInput) error {
@@ -408,10 +479,75 @@ func (e *entity) handlers(ctx workflow.Context) error {
 			if len(in.Events) == 0 {
 				return temporal.NewNonRetryableApplicationError("The event list is empty.", ErrBadInput, nil)
 			}
-			if e.chain.Stream != "" && e.chain.Stream != in.Stream {
-				return temporal.NewNonRetryableApplicationError("The stream is not the stream of this workflow.", ErrBadInput, nil)
+			if err := e.checkStream(in.Stream); err != nil {
+				return err
+			}
+			if d := e.delivered(in.Delivery); d != nil {
+				return e.deliveredErr(*d)
 			}
 			return nil
+		}},
+	); err != nil {
+		return err
+	}
+
+	// commit: state.commit. The update checks the version, writes the
+	// document and appends the events, and a failed commit writes neither.
+	// The commit holds its document until it ends, so no other write of the
+	// document comes between the check and the write (see awaitDoc).
+	//
+	// When the stream is in this workflow (a spec: its document and its
+	// stream have one workflow), commitLocal puts the catalog entry first,
+	// then sets the document and gives the events their sequence numbers in
+	// the workflow task that completes the update. So the update's input and
+	// result in the history hold both, or the history holds neither, and no
+	// reader sees a sequence number before its event can be read.
+	//
+	// Else commitRemote delivers the events to the stream's workflow first
+	// (the Deliver activity, once: the delivery ID is fixed), and sets the
+	// document only after the delivery.
+	commitCheck := func(in CommitInput) error {
+		if !sameVersion(e.storedVersion(in.Collection, in.Key), in.Expected) {
+			return conflictErr(e.storedVersion(in.Collection, in.Key))
+		}
+		return nil
+	}
+	if err := workflow.SetUpdateHandlerWithOptions(ctx, UpdateCommit,
+		func(ctx workflow.Context, in CommitInput) (CommitResult, error) {
+			if err := e.awaitDoc(ctx, in.Collection, in.Key); err != nil {
+				return CommitResult{}, err
+			}
+			if err := commitCheck(in); err != nil {
+				return CommitResult{}, err
+			}
+			local := in.StreamTarget == e.wfID
+			if local && len(in.Events) > 0 {
+				if err := e.checkStream(in.Stream); err != nil {
+					return CommitResult{}, err
+				}
+			}
+			e.touch()
+			k := docKey(in.Collection, in.Key)
+			e.writing[k] = true
+			defer delete(e.writing, k)
+			if local || len(in.Events) == 0 {
+				return e.commitLocal(ctx, in)
+			}
+			if workflow.GetVersion(ctx, ChangeCommitDeliverFirst, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+				return e.commitRemoteV0(ctx, in)
+			}
+			return e.commitRemote(ctx, in)
+		},
+		workflow.UpdateHandlerOptions{Validator: func(ctx workflow.Context, in CommitInput) error {
+			if err := e.open(ctx, in.Bound); err != nil {
+				return err
+			}
+			if in.StreamTarget == e.wfID && len(in.Events) > 0 {
+				if err := e.checkStream(in.Stream); err != nil {
+					return err
+				}
+			}
+			return commitCheck(in)
 		}},
 	); err != nil {
 		return err
@@ -489,6 +625,90 @@ func (e *entity) handlers(ctx workflow.Context) error {
 			return e.open(ctx, in.Bound)
 		}},
 	)
+}
+
+// commitLocal is a commit whose events (if any) go to this workflow. The
+// catalog entry comes first: when it fails, the commit writes nothing. Then
+// the document and the events change in one workflow task, the task that
+// completes the update.
+func (e *entity) commitLocal(ctx workflow.Context, in CommitInput) (CommitResult, error) {
+	e.chain.N++
+	d := e.newDoc(ctx, in.Collection, in.Key, in.Value, in.Attributes, e.chain.N)
+	if err := e.catalogPut(ctx, d); err != nil {
+		return CommitResult{}, err
+	}
+	e.docs[docKey(in.Collection, in.Key)] = d
+	res := CommitResult{Version: d.Version, UpdatedAt: d.UpdatedAt}
+	if len(in.Events) > 0 {
+		res.Nonce = e.chain.Nonce
+		res.Seqs, res.Ats = e.appendEvents(ctx, in.Stream, in.Events)
+	}
+	return res, nil
+}
+
+// commitRemote is a commit whose events go to the stream's workflow. The
+// delivery comes first: when it fails, the commit writes nothing. Then the
+// document is set, and the catalog entry is put. When the catalog put fails
+// after the delivery, the commit stands (the document and the events are
+// written; the catalog is an index, and the next write of the document puts
+// its entry), so a caller never sends a written commit again.
+func (e *entity) commitRemote(ctx workflow.Context, in CommitInput) (CommitResult, error) {
+	e.chain.N++
+	n := e.chain.N
+	var res CommitResult
+	if err := e.deliver(ctx, in, e.version(n), &res); err != nil {
+		return CommitResult{}, err
+	}
+	d := e.newDoc(ctx, in.Collection, in.Key, in.Value, in.Attributes, n)
+	e.docs[docKey(in.Collection, in.Key)] = d
+	if err := e.catalogPut(ctx, d); err != nil {
+		workflow.GetLogger(ctx).Warn("The commit is written, but its catalog entry is not. The next write of the document puts it.",
+			"collection", in.Collection, "error", err)
+	}
+	res.Version, res.UpdatedAt = d.Version, d.UpdatedAt
+	return res, nil
+}
+
+// commitRemoteV0 is the first shape of a remote commit: the document, then
+// the delivery. Only the replay of a history from before
+// ChangeCommitDeliverFirst takes it.
+func (e *entity) commitRemoteV0(ctx workflow.Context, in CommitInput) (CommitResult, error) {
+	d, err := e.write(ctx, in.Collection, in.Key, in.Value, in.Attributes)
+	if err != nil {
+		return CommitResult{}, err
+	}
+	var res CommitResult
+	if err := e.deliver(ctx, in, d.Version, &res); err != nil {
+		return CommitResult{}, err
+	}
+	res.Version, res.UpdatedAt = d.Version, d.UpdatedAt
+	return res, nil
+}
+
+// deliver sends the events of a commit to the stream's workflow. The
+// delivery ID is the document's workflow ID and the commit's version, so a
+// second try of the activity adds no event.
+func (e *entity) deliver(ctx workflow.Context, in CommitInput, version string, res *CommitResult) error {
+	var ar AppendResult
+	err := workflow.ExecuteActivity(deliverCtx(ctx), ActivityDeliver, DeliverInput{
+		WorkflowID: in.StreamTarget, TaskQueue: in.StreamQueue, Stream: in.Stream, Events: in.Events,
+		ID: e.wfID + "/" + version,
+	}).Get(ctx, &ar)
+	if err != nil {
+		return err
+	}
+	res.Remote, res.Nonce, res.Seqs = true, ar.Nonce, ar.Seqs
+	return nil
+}
+
+// deliveredErr refuses a delivery that the stream has already. Its detail
+// is the AppendResult of the first delivery (with no times).
+func (e *entity) deliveredErr(d Delivery) error {
+	res := AppendResult{Nonce: e.chain.Nonce}
+	for i := 0; i < d.Count; i++ {
+		res.Seqs = append(res.Seqs, d.FirstSeq+int64(i))
+	}
+	return temporal.NewNonRetryableApplicationError("The stream has the events of this delivery already.", ErrDelivered, nil, res)
 }
 
 // loop waits until the run must continue as new (end false) or end (end true).

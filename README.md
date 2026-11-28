@@ -14,13 +14,15 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 4. [Run with Temporal Cloud](#run-with-temporal-cloud)
 5. [Run with a self-hosted Temporal](#run-with-a-self-hosted-temporal)
 6. [How history and replay work](#how-history-and-replay-work)
+   - [state.commit](#statecommit)
 7. [The retention rule and the export](#the-retention-rule-and-the-export)
 8. [Move a relay from its built-in Temporal store](#move-a-relay-from-its-built-in-temporal-store)
 9. [Development](#development)
 
 ## What the plugin does
 
-- It gives the capabilities `state`, `events`, `watch` and `blobs` of the protocol version 1.0, and the test hook `continueStream`.
+- It speaks the protocol versions 1.0 and 1.1. It gives the capabilities `state`, `events`, `watch` and `blobs`, the call `state.commit` of 1.1 (see [state.commit](#statecommit)), and the test hook `continueStream`.
+- When the handshake chooses 1.1, the result has `storeId`: `temporal:<namespace>/<namespace ID>/<deploy_id>`. The namespace ID comes from Temporal (`DescribeNamespace`), so two servers that each have a namespace `default` give two values. The address is not part of it: one namespace has many addresses (the namespace endpoint and the regional endpoint of Temporal Cloud, a cluster service name and a public host, `localhost` and `127.0.0.1`). Two plugin processes on the same namespace and deploy ID use the same workflows, so they give the same `storeId`. The app and the relay compare it to know that they share one store.
 - It keeps one workflow for each spec, one for each desk and one for the relay config. It uses the relay's workflow IDs and task queues:
 
   | Data | Workflow ID | Task queue |
@@ -34,12 +36,23 @@ The plugin speaks the backend plugin protocol of [plugin-sdk](https://github.com
 
   A repo key gets the relay's IDs only when it has the relay's form: 12 lowercase hex digits. Any other key gets the generic ID of the last two rows.
 
-- Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes.
+- Each write is one workflow update. The update checks the expected version and writes in one step, so a compare and swap is atomic, also between two processes. `state.commit` is one update too: it writes a document and appends its events.
 - Each collection has a list workflow, `catalog/<deploy_id>/<collection>`. A list shows each write that returned. The list workflow of the `relay` collection is on `<task_queue>-config`.
 - The plugin encrypts every payload with the owner's payload keys. It uses the relay's codec (AES-256-GCM), so the relay's codec endpoints for the Temporal Web UI still work. The workflows of the `relay` collection (the relay config, other `relay` documents and their list workflow) use the config key. All other workflows use the data key.
 - The plugin never writes a key, a secret setting or a payload to its log, to an error or to a result.
 - It keeps blobs (files) in an S3-compatible bucket, or in a local folder.
-- The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker.
+- The plugin process is a Temporal client and a Temporal worker. It runs the workflows itself. You do not run another worker. The worker depends on the host kind of the handshake (see [The workers by host kind](#the-workers-by-host-kind)).
+
+### The workers by host kind
+
+- `app`, `relay` and `test`: the plugin starts a worker on the data task queue and one on the config task queue when it opens, and runs them until its shutdown.
+- `cli` (the `studio` CLI starts one plugin process for each command): the plugin is a Temporal client first. It starts the worker of a task queue only when it needs it:
+  - when it opens, if Temporal saw no other worker poll the task queue in the last 90 seconds (the app and the relay are closed). Then nobody else runs the workflows, so the CLI's calls need this worker.
+  - when a call waits for a worker, the plugin checks Temporal each second. It starts the worker of the call's task queue (only that one) when no other worker serves it: no other poller polled again since the call began, and (for an update) the call's workflow task waits in the task queue. A server that gives no backlog figure for the task queue (before 1.28) counts only a poller that polled again, so there the CLI starts its worker after 1 second. A check that fails, or that ends after the call, starts no worker. For example, the app closed a moment ago, and Temporal still lists its poller. A slow app (a far region, a long replay) takes the task, so the CLI does not join it. A new worker takes about 1 more second to get the task.
+
+  So while the app or the relay runs, a CLI process takes none of their workflow tasks or activities. A write of the CLI waits for "accepted" first, so a long `watch.wait` starts no worker. The pollers of a CLI worker have an identity that ends in `@studio-cli`, and they do not count as another worker: the next command does not wait for the last one. So only a plugin that lives for one command uses the host kind `cli`: the app's long-running agent (`studio agent run`) uses `app`. After the plugin starts a worker, a query that gets "no poller seen" tries again for 2 seconds.
+
+  At the shutdown (`plugin.shutdown`, the end of stdin, SIGINT or SIGTERM) the plugin stops its workers gracefully: Temporal gives their sticky workflows to another worker at once, and an activity in progress gets 4 seconds to end and report (WorkerStopTimeout); the plugin closes its Temporal connection only after that. This fits the 5 seconds of the shutdown; a CLI process with no activity in progress stops at once. An activity that does not end in time is cancelled, and Temporal gives it again after its timeout. If a CLI process ends abruptly (SIGKILL), a workflow that it ran goes back to the normal task queue after 1 second (its sticky timeout; the default is 5 seconds).
 
 The plugin knows no Spec Studio rule. The host applies its rules and stores the result. The plugin knows the relay's names only to choose a workflow.
 
@@ -132,12 +145,40 @@ For a server with TLS, set `auth=tls`. The plugin needs no search attribute.
 
 The workflow history is the event log.
 
-- Each `events.append` is one workflow update. The update's input holds the events. Its result holds their sequence numbers and times. Both stay in the history.
-- An `events.read` reads the history of each run of the workflow, takes the completed `append` updates, and returns their events in order.
+- Each `events.append` is one workflow update, and each `state.commit` with events is one `commit` update (see below). The update's input holds the events. Its result holds their sequence numbers and times. Both stay in the history.
+- An `events.read` reads the history of each run of the workflow, takes the completed `append` and `commit` updates of the stream, and returns their events in order. A `commit` whose events went to the workflow of another stream (its result says `remote`) has no event in this history: the stream's workflow has them as an `append`. The app writes its activity lines with `state.commit`, so a spec's history has most of its events in `commit` updates.
 - A cursor is opaque. It names the event's sequence number in its chain of runs. A cursor stays valid after a run ends.
 - A read can go by cursor (`after`) or by time (`from` and `to`). An event's time is the host's `at`, or the time that the plugin stored it. The app sets `at` when it sends events late, after it was offline.
 
 The relay and the app write to the same spec workflow. So the relay's messages and the app's activity lines are in one ordered history. The app's scrubber reads the events of a time range, and reads a snapshot of a document from `blobs` by the SHA-256 that an event holds.
+
+### state.commit
+
+`state.commit` (protocol 1.1) writes a document and appends its events to a stream in one atomic step. The plugin sends one `commit` update to the workflow of the document.
+
+- The update's validator checks the expected version. A stale version gets `conflict` with the stored version. The validator refuses the update, so the history has no event of it: no document and no event changes.
+- A commit holds its document until it ends. Another `put`, `delete` or `commit` of the same document waits, then checks its version again. So nothing comes between a commit's check and its write.
+- A failed commit writes nothing: no document and no event.
+- A spec's document and its stream have the same workflow: `app-specs`, `specs` or `closed-specs` / `<repoKey>:<slug>` and the stream `spec:<repoKey>:<slug>` are all in `spec-<deploy_id>-<repoKey>-<slug>`. The update handler first puts the document's entry in the list workflow. Then, in the workflow task that completes the update, it sets the document and gives the events their sequence numbers. So no reader sees a sequence number (from `watch.wait`, or after an `append` that came later) before `events.read` can return its event. When the list put fails, the commit writes nothing. The update's input (the document and the events) and its result (the version and the sequence numbers) are in the history together. So the history holds both, or neither. An `events.read` takes the events of the completed `commit` updates and of the `append` updates, in order.
+- A document and a stream with two workflows (any other names, for example a document `notes/a` and a stream `notes-log`): the update first sends the events to the stream's workflow with the `Deliver` activity. Temporal runs the activity again until the stream takes the events. Only after the delivery does the update set the document and put its list entry, and then it completes. When the delivery fails (the stream refuses it), the commit writes nothing. The stream keeps the last 64 delivery IDs (`<document workflow>/<version>`) in its chain, so a delivery that comes again adds no event. For a short time at the end of the commit, a reader can see the events before the new document. When the list put fails after the delivery, the commit stands (the document and the events are written), and the next write of the document puts its list entry. The commits of one document go one at a time, in the order of their versions.
+- A document of the `relay` collection uses the config key. A commit of such a document with events in a stream of the data key gets `refused`.
+- `events` can be empty. Then the update writes only the document, and the result has no cursor.
+
+Limits of one commit:
+
+- The whole request is at most `maxMessageBytes` (1.5 MiB), as for `events.append`, so the update's input stays under Temporal's payload limit (2 MB). The plugin-sdk refuses a larger request. No other limit applies to the number of events: split a large batch into more commits.
+- A commit is one update of the run. It counts toward the run limit (2000) and the continue-as-new rules, as an `append` does. A run that closes refuses the update, and the plugin sends it again to the next run.
+- The document counts toward the 512 KiB of documents in a continue-as-new input, as for `state.put`.
+
+### Update every plugin-temporal of a deploy together
+
+The app's plugin and the relay's plugin are Temporal workers on the same task queue, `relay-<deploy_id>` (and a `studio` CLI process, while the app and the relay are closed). Each one can run a workflow task of any spec workflow. So they must run the same version of plugin-temporal. An older plugin-temporal (one with no `commit` update) on the same task queue:
+
+- does not know the `commit` update. When it gets one, it rejects it: the commit writes nothing, and the caller gets `unavailable` with a text that says to update every plugin-temporal of the deploy.
+- cannot replay a history that has a `commit` update. Its workflow task fails, and Temporal gives the task again, maybe to the same worker. It has no `Deliver` activity, so that activity waits for a newer worker.
+- drops the delivery IDs of a stream's chain when it continues the run as new. Then a delivery that comes again can add its events a second time.
+
+The plugin cannot prevent this by itself. So update the relay's plugin-temporal and every app on the same deploy together, before the app uses protocol 1.1 (`state.commit`). Each change to the workflow code uses `workflow.GetVersion`, so a newer worker replays the histories of an older one.
 
 ## The retention rule and the export
 
@@ -166,7 +207,7 @@ A relay that used its built-in Temporal store moves to this plugin with the same
 
 - Go 1.26 or later.
 - `go test ./...`: the unit tests, the workflow tests (the Temporal Go SDK test suite), and the replay tests.
-- The replay tests replay each history in `internal/workflows/testdata/histories`. A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh <name>`, for example `v2`. The script writes `<name>-*.json` and never replaces the files of an earlier shape: they must still replay.
+- The replay tests replay each history in `internal/workflows/testdata/histories`. The `v2-*` histories have `commit` updates and a `Deliver` activity. The `v3-*` histories have the remote commit that delivers first (`commit-deliver-first`). A change that makes a workflow give other commands for a stored history fails them. To change a workflow's shape, use `workflow.GetVersion`, then add new histories with `scripts/capture-histories.sh <name>`, for example `v2`. The script writes `<name>-*.json` and never replaces the files of an earlier shape: they must still replay. The repo is public, so the script replaces the worker identities and the sticky task queue names (they hold the computer's name) with `test-worker`; a test fails on a history that still has them.
 - The integration tests need a Temporal dev server, and for the bucket test an S3-compatible server:
 
   ```sh

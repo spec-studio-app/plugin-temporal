@@ -99,3 +99,17 @@ func TestReplayCatchesBreak(t *testing.T) {
 		}
 	}
 }
+
+// The stored histories are in a public repo: they hold no computer name.
+// Each one is as ScrubHistory leaves it.
+func TestHistoriesAreScrubbed(t *testing.T) {
+	for _, f := range histories(t) {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(ScrubHistory(raw), raw) {
+			t.Errorf("%s has a worker identity or a sticky task queue that is not %q: run it through ScrubHistory", f, HistoryWorker)
+		}
+	}
+}

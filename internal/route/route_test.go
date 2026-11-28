@@ -52,3 +52,19 @@ func TestNoCollisions(t *testing.T) {
 		t.Fatal("a key that is not a relay repo key gets a relay ID")
 	}
 }
+
+// R2 (state.commit): the app's spec document app-specs/<repoKey>:<slug> and
+// its stream spec:<repoKey>:<slug> have one workflow, so a commit is one
+// update of one workflow. A slug with ":" stays in the same workflow too.
+func TestSpecDocAndStreamShareAWorkflow(t *testing.T) {
+	for _, key := range []string{"1a2b3c4d5e6f:fix-login", "1a2b3c4d5e6f:a:b", "1a2b3c4d5e6f:x..y"} {
+		doc, stream := r.Doc("app-specs", key), r.Stream("spec:"+key)
+		if doc != stream {
+			t.Fatalf("%s: the document has %+v and the stream has %+v", key, doc, stream)
+		}
+	}
+	// A key that is not the relay's form gets two workflows.
+	if r.Doc("app-specs", "notarepokey:x").WorkflowID == r.Stream("spec:notarepokey:x").WorkflowID {
+		t.Fatal("a generic key shares a workflow")
+	}
+}
